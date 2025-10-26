@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tectonic Map Generator</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px }
+    .container { max-width: 1600px; margin: 0 auto; background: #fff; border-radius: 20px; box-shadow: 0 20px 60px rgba(0, 0, 0, .3); overflow: hidden }
+    header { background: linear-gradient(135deg, #2d3748 0%, #1a202c 100%); color: #fff; padding: 30px; text-align: center }
+    h1 { font-size: 2.5em; margin-bottom: 10px }
+    .subtitle { opacity: .8; font-size: 1.1em }
+    .main-content { display: grid; grid-template-columns: 340px 1fr; gap: 20px; padding: 20px }
+    .controls { background: #f7fafc; padding: 20px; border-radius: 10px; height: fit-content; position: sticky; top: 20px }
+    .control-group { margin-bottom: 22px }
+    .control-group label { display: block; font-weight: 600; margin-bottom: 8px; color: #2d3748; font-size: .95em }
+    .value-display { float: right; color: #667eea; font-weight: 600 }
+    .control-group input[type="range"] { width: 100%; height: 6px; border-radius: 5px; background: #e2e8f0; outline: none; -webkit-appearance: none }
+    .control-group input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #667eea; cursor: pointer; transition: .3s }
+    .control-group input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); background: #764ba2 }
+    .control-group input[type="range"]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: #667eea; cursor: pointer; border: none; transition: .3s }
+    .control-group select { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e0; border-radius: 10px; background: #fff; color: #2d3748; font-weight: 600; outline: none; appearance: none; -webkit-appearance: none; -moz-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #667eea 50%), linear-gradient(135deg, #667eea 50%, transparent 50%), linear-gradient(to right, #e2e8f0, #e2e8f0); background-position: calc(100% - 20px) calc(1em + 2px), calc(100% - 15px) calc(1em + 2px), calc(100% - 2.5rem) .4em; background-size: 5px 5px, 5px 5px, 1px 1.7em; background-repeat: no-repeat }
+    .control-group select:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102, 126, 234, .25) }
+    button { width: 100%; padding: 14px; font-size: 1.05em; font-weight: 600; border: none; border-radius: 10px; cursor: pointer; transition: .3s; margin-bottom: 10px }
+    .generate-btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff }
+    .generate-btn:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(102, 126, 234, .4) }
+    .view-container { background: #2d3748; border-radius: 10px; overflow: hidden; position: relative; width: 1024px; height: 1024px; margin: 0 auto }
+    #mapCanvas { width: 100%; height: 100%; display: block; image-rendering: auto }
+    .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #fff; font-size: 1.5em; font-weight: 600; display: none }
+    .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #667eea; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 10px }
+    @keyframes spin { 0% { transform: rotate(0) } 100% { transform: rotate(360deg) } }
+    .legend { position: absolute; bottom: 20px; right: 20px; background: rgba(255, 255, 255, .9); padding: 15px; border-radius: 10px; font-size: .9em }
+    .legend-item { display: flex; align-items: center; margin: 5px 0 }
+    .legend-color { width: 30px; height: 20px; margin-right: 10px; border-radius: 4px; border: 1px solid #ccc }
+    .info-panel { background: #edf2f7; padding: 15px; border-radius: 10px; margin-top: 20px }
+    .info-panel h3 { margin-bottom: 10px; color: #2d3748 }
+    .info-item { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #cbd5e0 }
+    .info-item:last-child { border-bottom: none }
+    .inline { display: flex; gap: 10px; align-items: center }
+    .inline label { margin: 0 }
+    .dev { font-size: 12px; color: #4a5568; text-align: center; margin-top: 6px }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <header>
+      <h1>🌍 Tectonic Map Generator</h1>
+      <p class="subtitle">Realistic terrain generation using plate tectonics and erosion</p>
+    </header>
+
+    <div class="main-content">
+      <aside class="controls">
+        <div class="control-group">
+          <label>Map Type</label>
+          <select id="mapType">
+            <option value="continent">Continent</option>
+            <option value="archipelago">Archipelago</option>
+            <option value="island">Island</option>
+          </select>
+        </div>
+
+        <div class="control-group">
+          <label>Map Size (cells) <span class="value-display" id="sizeValue">512</span></label>
+          <input type="range" id="mapSize" min="128" max="1024" value="512" step="64">
+        </div>
+
+        <!-- Output Size only affects canvas pixel buffer -->
+        <div class="control-group">
+          <label>Output Size (px) <span class="value-display" id="outSizeValue">1024</span></label>
+          <input type="range" id="outputSize" min="1024" max="1600" value="1024" step="64">
+        </div>
+
+        <div class="control-group">
+          <label>Internal Resolution (px) <span class="value-display" id="resValue">1200</span></label>
+          <input type="range" id="mapResolution" min="400" max="2200" value="1200" step="50">
+        </div>
+
+        <div class="control-group" id="waterLevelGroup">
+          <label id="waterLevelLabel">Lake/Sea Amount (%) <span class="value-display" id="waterValue">15</span></label>
+          <input type="range" id="waterLevel" min="5" max="80" value="15" step="5">
+        </div>
+
+        <div class="control-group">
+          <label>Mountain Height <span class="value-display" id="mountainValue">50</span></label>
+          <input type="range" id="mountainIntensity" min="0" max="100" value="50" step="10">
+        </div>
+
+        <div class="control-group">
+          <label>Erosion Cycles <span class="value-display" id="erosionValue">5</span></label>
+          <input type="range" id="erosionStrength" min="0" max="20" value="5" step="1">
+        </div>
+
+        <div class="control-group">
+          <label>River Count <span class="value-display" id="riverValue">3</span></label>
+          <input type="range" id="riverCount" min="0" max="10" value="3" step="1">
+        </div>
+
+        <div class="control-group">
+          <label>Meander (0–1) <span class="value-display" id="meanderValue">0.6</span></label>
+          <input type="range" id="riverMeander" min="0" max="100" value="60" step="5">
+        </div>
+
+        <div class="control-group">
+          <label>Fractal Levels <span class="value-display" id="fractalValue">3</span></label>
+          <input type="range" id="fractalLevels" min="0" max="8" value="3" step="1">
+        </div>
+
+        <div class="control-group">
+          <label>River Width (px) <span class="value-display" id="widthValue">0.4</span></label>
+          <input type="range" id="riverWidth" min="0.1" max="2.5" value="0.4" step="0.1">
+        </div>
+
+        <!-- EXACTLY TWO MODES -->
+        <div class="control-group inline">
+          <input type="checkbox" id="modeColormap" checked />
+          <label for="modeColormap">Colormap mode (use provided gradient)</label>
+        </div>
+
+        <div class="control-group inline">
+          <input type="checkbox" id="sharpenToggle" />
+          <label for="sharpenToggle">Sharpen (edge-boost)</label>
+        </div>
+
+        <button class="generate-btn" onclick="generateMap()">🎲 Generate Map</button>
+        <button class="generate-btn" onclick="runTests()">🧪 Run Tests</button>
+        <div class="dev">Tests log to the browser console.</div>
+
+        <div class="info-panel">
+          <h3>Map Statistics</h3>
+          <div class="info-item"><span>Land Coverage:</span><span id="landCoverage">-</span></div>
+          <div class="info-item"><span>Highest Peak:</span><span id="highestPeak">-</span></div>
+          <div class="info-item"><span>Active Rivers:</span><span id="activeRivers">-</span></div>
+        </div>
+      </aside>
+
+      <main class="view-container">
+        <canvas id="mapCanvas"></canvas>
+        <div class="loading" id="loading">
+          <div class="spinner"></div>Generating terrain...
+        </div>
+        <div class="legend" id="legend"></div>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    // ===== Two discrete colormaps (0–1 floats) =====
+    const waterColormap = [
+      [0.113725, 0.239216, 0.470588],
+      [0.114089, 0.239719, 0.471147],
+      [0.114452, 0.240222, 0.471707],
+      [0.114816, 0.240726, 0.472266],
+      [0.115179, 0.241229, 0.472825],
+      [0.115543, 0.241732, 0.473384],
+      [0.115906, 0.242236, 0.473944],
+      [0.116270, 0.242739, 0.474503],
+      [0.116633, 0.243242, 0.475062],
+      [0.116997, 0.243745, 0.475621],
+      [0.117360, 0.244249, 0.476180],
+      [0.117724, 0.244752, 0.476740],
+      [0.118087, 0.245255, 0.477299],
+      [0.118451, 0.245759, 0.477858],
+      [0.118814, 0.246262, 0.478417],
+      [0.119178, 0.246765, 0.478977],
+      [0.119541, 0.247269, 0.479536],
+      [0.119905, 0.247772, 0.480095],
+      [0.120268, 0.248275, 0.480654],
+      [0.120632, 0.248778, 0.481214],
+      [0.120995, 0.249282, 0.481773],
+      [0.121359, 0.249785, 0.482332],
+      [0.121722, 0.250288, 0.482891],
+      [0.122086, 0.250792, 0.483450],
+      [0.122449, 0.251295, 0.484010],
+      [0.122813, 0.251798, 0.484569],
+      [0.123176, 0.252302, 0.485128],
+      [0.123540, 0.252805, 0.485687],
+      [0.123903, 0.253308, 0.486247],
+      [0.124267, 0.253811, 0.486806],
+      [0.124630, 0.254315, 0.487365],
+      [0.124994, 0.254818, 0.487924],
+      [0.125357, 0.255321, 0.488483],
+      [0.125721, 0.255825, 0.489043],
+      [0.126084, 0.256328, 0.489602],
+      [0.126448, 0.256831, 0.490161],
+      [0.126811, 0.257335, 0.490720],
+      [0.127175, 0.257838, 0.491280],
+      [0.127538, 0.258341, 0.491839],
+      [0.127902, 0.258845, 0.492398],
+      [0.128265, 0.259348, 0.492957],
+      [0.128629, 0.259851, 0.493516],
+      [0.128992, 0.260354, 0.494076],
+      [0.129356, 0.260858, 0.494635],
+      [0.129719, 0.261361, 0.495194],
+      [0.130083, 0.261864, 0.495753],
+      [0.130446, 0.262368, 0.496313],
+      [0.130810, 0.262871, 0.496872],
+      [0.131173, 0.263374, 0.497431],
+      [0.131537, 0.263878, 0.497990],
+      [0.131900, 0.264381, 0.498550],
+      [0.132264, 0.264884, 0.499109],
+      [0.132627, 0.265387, 0.499668],
+      [0.132991, 0.265891, 0.500227],
+      [0.133354, 0.266394, 0.500786],
+      [0.133718, 0.266897, 0.501346],
+      [0.134081, 0.267401, 0.501905],
+      [0.134445, 0.267904, 0.502464],
+      [0.134808, 0.268407, 0.503023],
+      [0.135172, 0.268911, 0.503583],
+      [0.135535, 0.269414, 0.504142],
+      [0.135899, 0.269917, 0.504701],
+      [0.136262, 0.270420, 0.505260],
+      [0.136626, 0.270924, 0.505819],
+      [0.136989, 0.271427, 0.506379],
+      [0.137353, 0.271930, 0.506938],
+      [0.137716, 0.272434, 0.507497],
+      [0.138080, 0.272937, 0.508056],
+      [0.138443, 0.273440, 0.508616],
+      [0.138807, 0.273944, 0.509175],
+      [0.139170, 0.274447, 0.509734],
+      [0.139534, 0.274950, 0.510293],
+      [0.139897, 0.275453, 0.510852],
+      [0.140261, 0.275957, 0.511412],
+      [0.140624, 0.276460, 0.511971],
+      [0.140988, 0.276963, 0.512530],
+      [0.141351, 0.277467, 0.513089],
+      [0.141715, 0.277970, 0.513649],
+      [0.142078, 0.278473, 0.514208],
+      [0.142442, 0.278977, 0.514767],
+      [0.142805, 0.279480, 0.515326],
+      [0.143169, 0.279983, 0.515885],
+      [0.143532, 0.280487, 0.516445],
+      [0.143896, 0.280990, 0.517004],
+      [0.144259, 0.281493, 0.517563],
+      [0.144623, 0.281996, 0.518122],
+      [0.144986, 0.282500, 0.518682],
+      [0.145350, 0.283003, 0.519241],
+      [0.145713, 0.283506, 0.519800],
+      [0.146077, 0.284010, 0.520359],
+      [0.146440, 0.284513, 0.520919],
+      [0.146804, 0.285016, 0.521478],
+      [0.147167, 0.285520, 0.522037],
+      [0.147531, 0.286023, 0.522596],
+      [0.147894, 0.286526, 0.523155],
+      [0.148258, 0.287029, 0.523715],
+      [0.148621, 0.287533, 0.524274],
+      [0.148985, 0.288036, 0.524833],
+      [0.149348, 0.288539, 0.525392],
+      [0.149712, 0.289043, 0.525952],
+      [0.150075, 0.289546, 0.526511],
+      [0.150439, 0.290049, 0.527070],
+      [0.150802, 0.290553, 0.527629],
+      [0.151166, 0.291056, 0.528188],
+      [0.151529, 0.291559, 0.528748],
+      [0.151893, 0.292062, 0.529307],
+      [0.152256, 0.292566, 0.529866],
+      [0.152620, 0.293069, 0.530425],
+      [0.152983, 0.293572, 0.530985],
+      [0.153347, 0.294076, 0.531544],
+      [0.153710, 0.294579, 0.532103],
+      [0.154074, 0.295082, 0.532662],
+      [0.154437, 0.295586, 0.533221],
+      [0.154801, 0.296089, 0.533781],
+      [0.155164, 0.296592, 0.534340],
+      [0.155528, 0.297096, 0.534899],
+      [0.155891, 0.297599, 0.535458],
+      [0.156255, 0.298102, 0.536018],
+      [0.156618, 0.298605, 0.536577],
+      [0.156982, 0.299109, 0.537136],
+      [0.157345, 0.299612, 0.537695],
+      [0.157709, 0.300115, 0.538255],
+      [0.158072, 0.300619, 0.538814],
+      [0.158436, 0.301122, 0.539373],
+      [0.158799, 0.301625, 0.539932],
+      [0.159163, 0.302129, 0.540491],
+      [0.159526, 0.302632, 0.541051],
+      [0.159890, 0.303135, 0.541610],
+      [0.160253, 0.303638, 0.542169],
+      [0.160617, 0.304142, 0.542728],
+      [0.160980, 0.304645, 0.543288],
+      [0.161344, 0.305148, 0.543847],
+      [0.161707, 0.305652, 0.544406],
+      [0.162071, 0.306155, 0.544965],
+      [0.162434, 0.306658, 0.545524],
+      [0.162798, 0.307162, 0.546084],
+      [0.163161, 0.307665, 0.546643],
+      [0.163525, 0.308168, 0.547202],
+      [0.163888, 0.308671, 0.547761],
+      [0.164252, 0.309175, 0.548321],
+      [0.164615, 0.309678, 0.548880],
+      [0.165398, 0.310598, 0.549558],
+      [0.166321, 0.311658, 0.550276],
+      [0.167243, 0.312717, 0.550993],
+      [0.168166, 0.313777, 0.551711],
+      [0.169089, 0.314836, 0.552429],
+      [0.170012, 0.315896, 0.553146],
+      [0.170934, 0.316955, 0.553864],
+      [0.171857, 0.318014, 0.554582],
+      [0.172780, 0.319074, 0.555299],
+      [0.173702, 0.320133, 0.556017],
+      [0.174625, 0.321193, 0.556735],
+      [0.175548, 0.322252, 0.557452],
+      [0.176471, 0.323312, 0.558170],
+      [0.177393, 0.324371, 0.558888],
+      [0.178316, 0.325430, 0.559605],
+      [0.179239, 0.326490, 0.560323],
+      [0.180161, 0.327549, 0.561041],
+      [0.181084, 0.328609, 0.561758],
+      [0.182007, 0.329668, 0.562476],
+      [0.182930, 0.330727, 0.563194],
+      [0.183852, 0.331787, 0.563911],
+      [0.184775, 0.332846, 0.564629],
+      [0.185698, 0.333906, 0.565347],
+      [0.186621, 0.334965, 0.566064],
+      [0.187543, 0.336025, 0.566782],
+      [0.188466, 0.337084, 0.567500],
+      [0.189389, 0.338143, 0.568217],
+      [0.190311, 0.339203, 0.568935],
+      [0.191234, 0.340262, 0.569653],
+      [0.192157, 0.341322, 0.570370],
+      [0.193080, 0.342381, 0.571088],
+      [0.194002, 0.343441, 0.571806],
+      [0.194925, 0.344500, 0.572523],
+      [0.195848, 0.345559, 0.573241],
+      [0.196770, 0.346619, 0.573959],
+      [0.197693, 0.347678, 0.574676],
+      [0.198616, 0.348738, 0.575394],
+      [0.199539, 0.349797, 0.576112],
+      [0.200461, 0.350857, 0.576829],
+      [0.201384, 0.351916, 0.577547],
+      [0.202307, 0.352975, 0.578265],
+      [0.203230, 0.354035, 0.578982],
+      [0.204152, 0.355094, 0.579700],
+      [0.205075, 0.356154, 0.580418],
+      [0.205998, 0.357213, 0.581135],
+      [0.206920, 0.358272, 0.581853],
+      [0.207843, 0.359332, 0.582571],
+      [0.208766, 0.360391, 0.583288],
+      [0.209689, 0.361451, 0.584006],
+      [0.210611, 0.362510, 0.584724],
+      [0.211534, 0.363570, 0.585441],
+      [0.212457, 0.364629, 0.586159],
+      [0.213379, 0.365688, 0.586877],
+      [0.214302, 0.366748, 0.587595],
+      [0.215225, 0.367807, 0.588312],
+      [0.216148, 0.368867, 0.589030],
+      [0.217070, 0.369926, 0.589748],
+      [0.217993, 0.370986, 0.590465],
+      [0.218916, 0.372045, 0.591183],
+      [0.219839, 0.373104, 0.591901],
+      [0.220761, 0.374164, 0.592618],
+      [0.221684, 0.375223, 0.593336],
+      [0.222607, 0.376283, 0.594054],
+      [0.223529, 0.377342, 0.594771],
+      [0.224452, 0.378401, 0.595489],
+      [0.225375, 0.379461, 0.596207],
+      [0.226298, 0.380520, 0.596924],
+      [0.227220, 0.381580, 0.597642],
+      [0.228143, 0.382639, 0.598360],
+      [0.229066, 0.383699, 0.599077],
+      [0.229988, 0.384758, 0.599795],
+      [0.230911, 0.385817, 0.600513],
+      [0.231834, 0.386877, 0.601230],
+      [0.232757, 0.387936, 0.601948],
+      [0.233679, 0.388996, 0.602666],
+      [0.234602, 0.390055, 0.603383],
+      [0.235525, 0.391115, 0.604101],
+      [0.236448, 0.392174, 0.604819],
+      [0.237370, 0.393233, 0.605536],
+      [0.238293, 0.394293, 0.606254],
+      [0.239216, 0.395352, 0.606972],
+      [0.240138, 0.396412, 0.607689],
+      [0.241061, 0.397471, 0.608407],
+      [0.241984, 0.398530, 0.609125],
+      [0.242907, 0.399590, 0.609842],
+      [0.243829, 0.400649, 0.610560],
+      [0.244752, 0.401709, 0.611278],
+      [0.245675, 0.402768, 0.611995],
+      [0.246597, 0.403828, 0.612713],
+      [0.247520, 0.404887, 0.613431],
+      [0.248443, 0.405946, 0.614148],
+      [0.249366, 0.407006, 0.614866],
+      [0.250288, 0.408065, 0.615584],
+      [0.251211, 0.409125, 0.616301],
+      [0.252134, 0.410184, 0.617019],
+      [0.253057, 0.411244, 0.617737],
+      [0.253979, 0.412303, 0.618454],
+      [0.254902, 0.413362, 0.619172],
+      [0.255825, 0.414422, 0.619890],
+      [0.256747, 0.415481, 0.620607],
+      [0.257670, 0.416541, 0.621325],
+      [0.258593, 0.417600, 0.622043],
+      [0.259516, 0.418659, 0.622760],
+      [0.260438, 0.419719, 0.623478],
+      [0.261361, 0.420778, 0.624196],
+      [0.262284, 0.421838, 0.624913],
+      [0.263206, 0.422897, 0.625631],
+      [0.264129, 0.423957, 0.626349],
+      [0.265052, 0.425016, 0.627067],
+      [0.265975, 0.426075, 0.627784],
+      [0.266897, 0.427135, 0.628502],
+      [0.267820, 0.428194, 0.629220],
+      [0.268743, 0.429254, 0.629937],
+      [0.269666, 0.430313, 0.630655],
+      [0.270588, 0.431373, 0.631373],
+    ];
+
+    const landColormap = [
+      [0.796078, 0.745098, 0.560784],
+      [0.786236, 0.740279, 0.554940],
+      [0.776394, 0.735461, 0.549097],
+      [0.766551, 0.730642, 0.543253],
+      [0.756709, 0.725823, 0.537409],
+      [0.746867, 0.721005, 0.531565],
+      [0.737024, 0.716186, 0.525721],
+      [0.727182, 0.711367, 0.519877],
+      [0.717339, 0.706549, 0.514033],
+      [0.707497, 0.701730, 0.508189],
+      [0.697655, 0.696911, 0.502345],
+      [0.687812, 0.692093, 0.496501],
+      [0.677970, 0.687274, 0.490657],
+      [0.668128, 0.682455, 0.484814],
+      [0.658285, 0.677637, 0.478970],
+      [0.648443, 0.672818, 0.473126],
+      [0.638601, 0.667999, 0.467282],
+      [0.628758, 0.663181, 0.461438],
+      [0.618916, 0.658362, 0.455594],
+      [0.609073, 0.653544, 0.449750],
+      [0.599231, 0.648725, 0.443906],
+      [0.589389, 0.643906, 0.438062],
+      [0.579546, 0.639088, 0.432218],
+      [0.569704, 0.634269, 0.426374],
+      [0.559862, 0.629450, 0.420531],
+      [0.550019, 0.624632, 0.414687],
+      [0.540177, 0.619813, 0.408843],
+      [0.530334, 0.614994, 0.402999],
+      [0.520492, 0.610176, 0.397155],
+      [0.510650, 0.605357, 0.391311],
+      [0.500807, 0.600538, 0.385467],
+      [0.490965, 0.595720, 0.379623],
+      [0.481123, 0.590901, 0.373779],
+      [0.471280, 0.586082, 0.367935],
+      [0.461438, 0.581264, 0.362092],
+      [0.451596, 0.576445, 0.356248],
+      [0.441753, 0.571626, 0.350404],
+      [0.431911, 0.566808, 0.344560],
+      [0.422068, 0.561989, 0.338716],
+      [0.418085, 0.559077, 0.336194],
+      [0.416055, 0.556801, 0.334779],
+      [0.414025, 0.554525, 0.333364],
+      [0.411995, 0.552249, 0.331949],
+      [0.409965, 0.549973, 0.330534],
+      [0.407935, 0.547697, 0.329120],
+      [0.405905, 0.545421, 0.327705],
+      [0.403875, 0.543145, 0.326290],
+      [0.401845, 0.540869, 0.324875],
+      [0.399815, 0.538593, 0.323460],
+      [0.397785, 0.536317, 0.322045],
+      [0.395755, 0.534041, 0.320631],
+      [0.393725, 0.531765, 0.319216],
+      [0.391696, 0.529489, 0.317801],
+      [0.389666, 0.527213, 0.316386],
+      [0.387636, 0.524937, 0.314971],
+      [0.385606, 0.522661, 0.313556],
+      [0.383576, 0.520384, 0.312141],
+      [0.381546, 0.518108, 0.310727],
+      [0.379516, 0.515832, 0.309312],
+      [0.377486, 0.513556, 0.307897],
+      [0.375456, 0.511280, 0.306482],
+      [0.373426, 0.509004, 0.305067],
+      [0.371396, 0.506728, 0.303652],
+      [0.369366, 0.504452, 0.302238],
+      [0.367336, 0.502176, 0.300823],
+      [0.365306, 0.499900, 0.299408],
+      [0.363276, 0.497624, 0.297993],
+      [0.361246, 0.495348, 0.296578],
+      [0.359216, 0.493072, 0.295163],
+      [0.357186, 0.490796, 0.293749],
+      [0.355156, 0.488520, 0.292334],
+      [0.353126, 0.486244, 0.290919],
+      [0.351096, 0.483968, 0.289504],
+      [0.349066, 0.481692, 0.288089],
+      [0.347036, 0.479416, 0.286674],
+      [0.345006, 0.477140, 0.285260],
+      [0.342976, 0.474864, 0.283845],
+      [0.340946, 0.472587, 0.282430],
+      [0.338916, 0.470311, 0.281015],
+      [0.336886, 0.468035, 0.279600],
+      [0.334856, 0.465759, 0.278185],
+      [0.332826, 0.463483, 0.276770],
+      [0.330796, 0.461207, 0.275356],
+      [0.328766, 0.458931, 0.273941],
+      [0.326736, 0.456655, 0.272526],
+      [0.324706, 0.454379, 0.271111],
+      [0.322676, 0.452103, 0.269696],
+      [0.320646, 0.449827, 0.268281],
+      [0.318616, 0.447551, 0.266867],
+      [0.316586, 0.445275, 0.265452],
+      [0.314556, 0.442999, 0.264037],
+      [0.312526, 0.440723, 0.262622],
+      [0.310496, 0.438447, 0.261207],
+      [0.308466, 0.436171, 0.259792],
+      [0.306436, 0.433895, 0.258378],
+      [0.304406, 0.431619, 0.256963],
+      [0.302376, 0.429343, 0.255548],
+      [0.300346, 0.427067, 0.254133],
+      [0.298316, 0.424790, 0.252718],
+      [0.296286, 0.422514, 0.251303],
+      [0.294256, 0.420238, 0.249889],
+      [0.292226, 0.417962, 0.248474],
+      [0.290196, 0.415686, 0.247059],
+      [0.288474, 0.413779, 0.245890],
+      [0.286751, 0.411872, 0.244721],
+      [0.285029, 0.409965, 0.243552],
+      [0.283306, 0.408058, 0.242384],
+      [0.281584, 0.406151, 0.241215],
+      [0.279862, 0.404245, 0.240046],
+      [0.278139, 0.402338, 0.238877],
+      [0.276417, 0.400431, 0.237709],
+      [0.274694, 0.398524, 0.236540],
+      [0.272972, 0.396617, 0.235371],
+      [0.271250, 0.394710, 0.234202],
+      [0.269527, 0.392803, 0.233033],
+      [0.267805, 0.390896, 0.231865],
+      [0.266082, 0.388989, 0.230696],
+      [0.264360, 0.387082, 0.229527],
+      [0.262637, 0.385175, 0.228358],
+      [0.260915, 0.383268, 0.227190],
+      [0.259193, 0.381361, 0.226021],
+      [0.257470, 0.379454, 0.224852],
+      [0.255748, 0.377547, 0.223683],
+      [0.254025, 0.375640, 0.222514],
+      [0.252303, 0.373733, 0.221346],
+      [0.250581, 0.371826, 0.220177],
+      [0.248858, 0.369919, 0.219008],
+      [0.247136, 0.368012, 0.217839],
+      [0.245413, 0.366105, 0.216671],
+      [0.243691, 0.364198, 0.215502],
+      [0.241968, 0.362291, 0.214333],
+      [0.240246, 0.360384, 0.213164],
+      [0.238524, 0.358478, 0.211995],
+      [0.236801, 0.356571, 0.210827],
+      [0.235079, 0.354664, 0.209658],
+      [0.233356, 0.352757, 0.208489],
+      [0.231634, 0.350850, 0.207320],
+      [0.229912, 0.348943, 0.206151],
+      [0.228189, 0.347036, 0.204983],
+      [0.226467, 0.345129, 0.203814],
+      [0.224744, 0.343222, 0.202645],
+      [0.223022, 0.341315, 0.201476],
+      [0.221300, 0.339408, 0.200308],
+      [0.219577, 0.337501, 0.199139],
+      [0.217855, 0.335594, 0.197970],
+      [0.216132, 0.333687, 0.196801],
+      [0.214410, 0.331780, 0.195632],
+      [0.212687, 0.329873, 0.194464],
+      [0.210965, 0.327966, 0.193295],
+      [0.209243, 0.326059, 0.192126],
+      [0.207520, 0.324152, 0.190957],
+      [0.205798, 0.322245, 0.189789],
+      [0.204075, 0.320338, 0.188620],
+      [0.202353, 0.318431, 0.187451],
+      [0.200631, 0.316524, 0.186282],
+      [0.198908, 0.314617, 0.185113],
+      [0.197186, 0.312710, 0.183945],
+      [0.195463, 0.310804, 0.182776],
+      [0.193741, 0.308897, 0.181607],
+      [0.192018, 0.306990, 0.180438],
+      [0.190296, 0.305083, 0.179270],
+      [0.188574, 0.303176, 0.178101],
+      [0.186851, 0.301269, 0.176932],
+      [0.185129, 0.299362, 0.175763],
+      [0.183406, 0.297455, 0.174594],
+      [0.181684, 0.295548, 0.173426],
+      [0.182238, 0.294963, 0.173395],
+      [0.189619, 0.298347, 0.176778],
+      [0.197001, 0.301730, 0.180161],
+      [0.204383, 0.305113, 0.183545],
+      [0.211765, 0.308497, 0.186928],
+      [0.219146, 0.311880, 0.190311],
+      [0.226528, 0.315263, 0.193695],
+      [0.233910, 0.318647, 0.197078],
+      [0.241292, 0.322030, 0.200461],
+      [0.248674, 0.325413, 0.203845],
+      [0.256055, 0.328797, 0.207228],
+      [0.263437, 0.332180, 0.210611],
+      [0.270819, 0.335563, 0.213995],
+      [0.278201, 0.338947, 0.217378],
+      [0.285582, 0.342330, 0.220761],
+      [0.292964, 0.345713, 0.224145],
+      [0.300346, 0.349097, 0.227528],
+      [0.307728, 0.352480, 0.230911],
+      [0.315110, 0.355863, 0.234295],
+      [0.322491, 0.359246, 0.237678],
+      [0.329873, 0.362630, 0.241061],
+      [0.337255, 0.366013, 0.244444],
+      [0.344637, 0.369396, 0.247828],
+      [0.352018, 0.372780, 0.251211],
+      [0.359400, 0.376163, 0.254594],
+      [0.366782, 0.379546, 0.257978],
+      [0.374164, 0.382930, 0.261361],
+      [0.381546, 0.386313, 0.264744],
+      [0.388927, 0.389696, 0.268128],
+      [0.396309, 0.393080, 0.271511],
+      [0.403691, 0.396463, 0.274894],
+      [0.411073, 0.399846, 0.278278],
+      [0.418454, 0.403230, 0.281661],
+      [0.425836, 0.406613, 0.285044],
+      [0.433218, 0.409996, 0.288428],
+      [0.440600, 0.413379, 0.291811],
+      [0.447982, 0.416763, 0.295194],
+      [0.455363, 0.420146, 0.298577],
+      [0.462745, 0.423529, 0.301961],
+      [0.470127, 0.426913, 0.305344],
+      [0.477509, 0.430296, 0.308727],
+      [0.484890, 0.433679, 0.312111],
+      [0.492272, 0.437063, 0.315494],
+      [0.499654, 0.440446, 0.318877],
+      [0.507036, 0.443829, 0.322261],
+      [0.514418, 0.447213, 0.325644],
+      [0.521799, 0.450596, 0.329027],
+      [0.529181, 0.453979, 0.332411],
+      [0.536563, 0.457363, 0.335794],
+      [0.543945, 0.460746, 0.339177],
+      [0.551326, 0.464129, 0.342561],
+      [0.558888, 0.469281, 0.348507],
+      [0.566987, 0.479739, 0.362143],
+      [0.575087, 0.490196, 0.375779],
+      [0.583186, 0.500654, 0.389414],
+      [0.591285, 0.511111, 0.403050],
+      [0.599385, 0.521569, 0.416686],
+      [0.607484, 0.532026, 0.430322],
+      [0.615584, 0.542484, 0.443957],
+      [0.623683, 0.552941, 0.457593],
+      [0.631783, 0.563399, 0.471229],
+      [0.639882, 0.573856, 0.484865],
+      [0.647982, 0.584314, 0.498501],
+      [0.656081, 0.594771, 0.512136],
+      [0.664180, 0.605229, 0.525772],
+      [0.672280, 0.615686, 0.539408],
+      [0.680379, 0.626144, 0.553044],
+      [0.688479, 0.636601, 0.566679],
+      [0.696578, 0.647059, 0.580315],
+      [0.704678, 0.657516, 0.593951],
+      [0.712777, 0.667974, 0.607587],
+      [0.720877, 0.678431, 0.621223],
+      [0.728976, 0.688889, 0.634858],
+      [0.737075, 0.699346, 0.648494],
+      [0.745175, 0.709804, 0.662130],
+      [0.753274, 0.720261, 0.675766],
+      [0.761374, 0.730719, 0.689402],
+      [0.769473, 0.741176, 0.703037],
+      [0.777573, 0.751634, 0.716673],
+      [0.785672, 0.762092, 0.730309],
+      [0.793772, 0.772549, 0.743945],
+      [0.801871, 0.783007, 0.757580],
+      [0.809971, 0.793464, 0.771216],
+      [0.818070, 0.803922, 0.784852],
+      [0.826169, 0.814379, 0.798488],
+      [0.834269, 0.824837, 0.812124],
+      [0.842368, 0.835294, 0.825759],
+      [0.850468, 0.845752, 0.839395],
+      [0.858567, 0.856209, 0.853031],
+      [0.866667, 0.866667, 0.866667],
+    ];
+
+    // ===== Helpers =====
+    function buildLUT(cmap) { return cmap.map(([r, g, b]) => [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)]); }
+    function minMax(arr) { let mn = Infinity, mx = -Infinity; for (let i = 0; i < arr.length; i++) { const v = arr[i]; if (v < mn) mn = v; if (v > mx) mx = v; } return [mn, mx]; }
+
+    // Create separate LUTs for sea and land (no transitions between them)
+    const WATER_LUT = buildLUT(waterColormap);
+    const LAND_LUT  = buildLUT(landColormap);
+
+    // ===== Simplex Noise (unchanged) =====
+    class SimplexNoise {
+      constructor() {
+        this.grad3 = [[1, 1, 0], [-1, 1, 0], [1, -1, 0], [-1, -1, 0], [1, 0, 1], [-1, 0, 1], [1, 0, -1], [-1, 0, -1], [0, 1, 1], [0, -1, 1], [0, 1, -1], [0, -1, -1]];
+        const p = []; for (let i = 0; i < 256; i++) p[i] = i;
+        for (let i = 255; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+        this.perm = new Array(512); for (let i = 0; i < 512; i++) this.perm[i] = p[i & 255];
+      }
+      dot(g, x, y) { return g[0] * x + g[1] * y; }
+      noise(xin, yin) {
+        const F2 = 0.5 * (Math.sqrt(3) - 1), s = (xin + yin) * F2, i = Math.floor(xin + s), j = Math.floor(yin + s);
+        const G2 = (3 - Math.sqrt(3)) / 6, t = (i + j) * G2, X0 = i - t, Y0 = j - t, x0 = xin - X0, y0 = yin - Y0; let i1, j1; x0 > y0 ? (i1 = 1, j1 = 0) : (i1 = 0, j1 = 1);
+        const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2, x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2, ii = i & 255, jj = j & 255, gi0 = this.perm[ii + this.perm[jj]] % 12, gi1 = this.perm[ii + i1 + this.perm[jj + j1]] % 12, gi2 = this.perm[ii + 1 + this.perm[jj + 1]] % 12;
+        let t0 = 0.5 - x0 * x0 - y0 * y0; let n0 = t0 < 0 ? 0 : ((t0 *= t0) * t0 * this.dot(this.grad3[gi0], x0, y0));
+        let t1 = 0.5 - x1 * x1 - y1 * y1; let n1 = t1 < 0 ? 0 : ((t1 *= t1) * t1 * this.dot(this.grad3[gi1], x1, y1));
+        let t2 = 0.5 - x2 * x2 - y2 * y2; let n2 = t2 < 0 ? 0 : ((t2 *= t2) * t2 * this.dot(this.grad3[gi2], x2, y2));
+        return 70 * (n0 + n1 + n2);
+      }
+    }
+
+    // ===== Utilities =====
+    function lcg(seed) { let s = seed >>> 0; return () => { s = (1664525 * s + 1013904223) >>> 0; return (s & 0xffffffff) / 0x100000000; }; }
+    function fbm1D(noise, t, oct = 4, lac = 2.0, gain = 0.5) { let amp = 1, freq = 1, sum = 0, norm = 0; for (let i = 0; i < oct; i++) { sum += amp * noise.noise(t * freq, 0); norm += amp; amp *= gain; freq *= lac; } return sum / (norm || 1); }
+    function gaussianBlur1D(arr, r) { r = Math.max(1, r | 0); const sigma = r / 2, den = 2 * sigma * sigma, w = []; let wsum = 0; for (let k = -r; k <= r; k++) { const wk = Math.exp(-(k * k) / den); w.push(wk); wsum += wk; } const out = new Float32Array(arr.length); for (let i = 0; i < arr.length; i++) { let s = 0, ws = 0; for (let k = -r; k <= r; k++) { const j = Math.min(arr.length - 1, Math.max(0, i + k)); const wk = w[k + r]; s += arr[j] * wk; ws += wk; } out[i] = s / (ws || 1); } return out; }
+    function normalizeUnit(arr) { let mn = Infinity, mx = -Infinity; for (const v of arr) { if (v < mn) mn = v; if (v > mx) mx = v; } const r = mx - mn || 1; const out = new Float32Array(arr.length); for (let i = 0; i < arr.length; i++) out[i] = -1 + 2 * ((arr[i] - mn) / r); return out; }
+
+    // ===== Map Generator (unchanged logic) =====
+    class MapGenerator {
+      constructor(w, h) { this.width = w; this.height = h; this.heightmap = new Float32Array(w * h); this.riverMap = new Float32Array(w * h); this.noise = new SimplexNoise(); }
+      generateBaseTerrain() { const W = this.width, H = this.height, hm = this.heightmap, n = this.noise; for (let y = 0; y < H; y++) { for (let x = 0; x < W; x++) { const idx = y * W + x; let h = 0, amp = 1, freq = 0.005, maxA = 0; for (let o = 0; o < 5; o++) { h += amp * n.noise(x * freq, y * freq); maxA += amp; amp *= 0.5; freq *= 2; } hm[idx] = (h / maxA + 1) * 0.5; } } }
+      addTectonicFeatures(num) { const W = this.width, H = this.height, hm = this.heightmap; const plates = []; for (let i = 0; i < num; i++) plates.push({ x: Math.random() * W, y: Math.random() * H, e: (Math.random() * 0.3 - 0.15) }); for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { let a = Infinity, b = Infinity, ci = 0; for (let i = 0; i < plates.length; i++) { const dx = x - plates[i].x, dy = y - plates[i].y, d = Math.hypot(dx, dy); if (d < a) { b = a; a = d; ci = i; } else if (d < b) { b = d; } } const infl = Math.exp(-a / (W * 0.2)); hm[y * W + x] += plates[ci].e * infl; const bd = b - a; if (bd < 20) { hm[y * W + x] += Math.exp(-bd / 10) * 0.2 * Math.abs(this.noise.noise(x * 0.02, y * 0.02)); } } }
+      applyContinentMask() { this.normalize(); const W = this.width, H = this.height, n = this.noise, hm = this.heightmap; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const i = y * W + x; let h = hm[i]; const lf1 = n.noise(x * 0.002, y * 0.002) * 0.35, lf2 = n.noise(x * 0.004, y * 0.004) * 0.20, hf = n.noise(x * 0.015, y * 0.015) * 0.05; h = 0.25 + h * 0.70; h += lf1 + lf2 + hf; hm[i] = h; } this._boxBlur(1); this.normalize(); }
+      setInteriorSeaLevel(pct, edgeProtectPx = 18) { const arr = Array.from(this.heightmap).sort((a, b) => a - b); let sea = arr[Math.max(0, Math.min(arr.length - 1, Math.floor(arr.length * pct)))]; const W = this.width, H = this.height, edge = edgeProtectPx, hm = this.heightmap; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const idx = y * W + x; const dx = Math.min(x, W - 1 - x), dy = Math.min(y, H - 1 - y); const d = Math.min(dx, dy); const t = Math.max(0, Math.min(1, d / edge)); const boost = (1 - t) * 0.15; hm[idx] += boost; } this.normalize(); const arr2 = Array.from(hm).sort((a, b) => a - b); sea = arr2[Math.max(0, Math.min(arr2.length - 1, Math.floor(arr2.length * pct)))]; const low = sea, hi = 1.0, targetLow = 0.48, targetHi = 1.0; for (let i = 0; i < hm.length; i++) { const v = hm[i]; if (v <= low) { hm[i] = (v / low) * targetLow; } else { const t = (v - low) / (hi - low); hm[i] = targetLow + t * (targetHi - targetLow); } } }
+      applyIslandMask() { const W = this.width, H = this.height, n = this.noise, hm = this.heightmap; const cx = W / 2, cy = H / 2, baseR = Math.min(cx, cy) * 0.6; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const idx = y * W + x, dx = x - cx, dy = y - cy, dist = Math.hypot(dx, dy), ang = Math.atan2(dy, dx); let distortion = 0; distortion += n.noise(Math.cos(ang * 2) * 1.5, Math.sin(ang * 2) * 1.5) * baseR * 0.2; distortion += n.noise(Math.cos(ang * 5) * 2, Math.sin(ang * 5) * 2) * baseR * 0.1; distortion += n.noise(x * 0.01, y * 0.01) * baseR * 0.03; const r = baseR + distortion; if (dist < r) { const t = dist / r; const s = t * t * t * (t * (t * 6 - 15) + 10); const infl = 1.0 - s * 0.5; hm[idx] = hm[idx] * 0.6 + infl * 0.4; } else { const od = (dist - r) / baseR; hm[idx] = 0.2 - Math.min(1, od * 2) * 0.2; } } const edge = 15; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { if (x < edge || x >= W - edge || y < edge || y >= H - edge) { const idx = y * W + x; const d = Math.min(x, y, W - 1 - x, H - 1 - y); const f = d / edge; hm[idx] = Math.min(0.3, hm[idx] * f); } } }
+      smoothCoastlines() { this._boxBlur(2); }
+      applyErosion(iter) { for (let k = 0; k < iter; k++) { const W = this.width, H = this.height, hm = this.heightmap, nh = new Float32Array(hm); for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) { const i = y * W + x; if (hm[i] < 0.45) { nh[i] = hm[i]; continue; } let s = 0, c = 0; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { s += hm[(y + dy) * W + (x + dx)]; c++; } const avg = s / c, diff = Math.abs(avg - hm[i]), rate = Math.min(0.2, diff); nh[i] = hm[i] * (1 - rate) + avg * rate; } this.heightmap = nh; } }
+      _boxBlur(r) { const W = this.width, H = this.height, hm = this.heightmap; const tmp = new Float32Array(hm); for (let y = r; y < H - r; y++) for (let x = r; x < W - r; x++) { let s = 0, w = 0; for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) { const ww = 1 / (1 + Math.abs(dx) + Math.abs(dy)); s += hm[(y + dy) * W + (x + dx)] * ww; w += ww; } tmp[y * W + x] = s / w; } this.heightmap = tmp; }
+      generateRiversDelaunay(opts) {
+        const { count = 3, seaLevel = 0.48, meander = 0.6, fractalLevels = 3, width = 0.6 } = opts || {}; const W = this.width, H = this.height; this.riverMap.fill(0); const rivers = []; const targetPts = Math.min(1400, Math.max(300, Math.floor((W * H) / (512 * 512) * 900))); const step = Math.max(6, Math.sqrt((W * H) / targetPts)); const pts = []; for (let y = step * 0.5; y < H; y += step) { for (let x = step * 0.5; x < W; x += step) { const jx = x + (Math.random() - 0.5) * step * 0.6; const jy = y + (Math.random() - 0.5) * step * 0.6; const ix = Math.max(0, Math.min(W - 1, Math.round(jx))); const iy = Math.max(0, Math.min(H - 1, Math.round(jy))); const h = this.heightmap[iy * W + ix]; pts.push({ x: jx, y: jy, h }); } } for (let i = 0; i < Math.max(20, Math.floor(W / 16)); i++) { const side = Math.floor(Math.random() * 4); const x = (side === 0 ? 0 : side === 1 ? W - 1 : Math.random() * W); const y = (side === 2 ? 0 : side === 3 ? H - 1 : Math.random() * H); const ix = Math.max(0, Math.min(W - 1, Math.round(x))), iy = Math.max(0, Math.min(H - 1, Math.round(y))); const h = this.heightmap[iy * W + ix]; pts.push({ x, y, h }); }
+        const triangulate = (points) => { const minX = -W * 10, minY = -H * 10, maxX = W * 10, maxY = H * 10; const st = [{ x: minX, y: minY }, { x: 0, y: maxY * 2 }, { x: maxX, y: minY }]; const tris = [{ a: points.length, b: points.length + 1, c: points.length + 2 }]; const all = points.concat(st.map(p => ({ x: p.x, y: p.y, h: 0 }))); const cc = (p, q, r) => { const ax = p.x, ay = p.y, bx = q.x, by = q.y, cx = r.x, cy = r.y; const A = bx - ax, B = by - ay, C = cx - ax, D = cy - ay; const E = A * (ax + bx) + B * (ay + by); const F = C * (ax + cx) + D * (ay + cy); const G = 2 * (A * (cy - by) - B * (cx - bx)); if (Math.abs(G) < 1e-6) { return { x: Infinity, y: Infinity, r2: Infinity }; } const ux = (D * E - B * F) / G; const uy = (A * F - C * E) / G; const r2 = (ux - ax) * (ux - ax) + (uy - ay) * (uy - ay); return { x: ux, y: uy, r2 }; }; const contains = (circ, p) => { const dx = p.x - circ.x, dy = p.y - circ.y; return dx * dx + dy * dy <= circ.r2 + 1e-6; }; for (let i = 0; i < points.length; i++) { const p = points[i]; const bad = []; const circCache = []; for (let t = 0; t < tris.length; t++) { const tri = tris[t]; const c = circCache[t] || cc(all[tri.a], all[tri.b], all[tri.c]); circCache[t] = c; if (contains(c, p)) { bad.push(t); } } const edgeKey = (u, v) => u < v ? u + ',' + v : v + ',' + u; const edges = new Map(); for (const ti of bad) { const tri = tris[ti]; const e = [[tri.a, tri.b], [tri.b, tri.c], [tri.c, tri.a]]; for (const [u, v] of e) { const k = edgeKey(u, v); edges.set(k, (edges.get(k) || 0) ^ 1); } } bad.sort((a, b) => b - a).forEach(idx => tris.splice(idx, 1)); for (const [k, val] of edges) { if (val === 1) { const [u, v] = k.split(',').map(Number); tris.push({ a: u, b: v, c: i }); } } } const limit = points.length; return tris.filter(t => t.a < limit && t.b < limit && t.c < limit); };
+        const tris = triangulate(pts); const triData = tris.map(t => { const A = pts[t.a], B = pts[t.b], C = pts[t.c]; const cx = (A.x + B.x + C.x) / 3, cy = (A.y + B.y + C.y) / 3; const h = (A.h + B.h + C.h) / 3; return { v: [t.a, t.b, t.c], center: { x: cx, y: cy }, h, nbr: new Set() }; }); const edgeToTri = new Map(); const edgeKey = (u, v) => u < v ? u + ',' + v : v + ',' + u; tris.forEach((t, ti) => { const e = [[t.a, t.b], [t.b, t.c], [t.c, t.a]]; for (const [u, v] of e) { const k = edgeKey(u, v); if (edgeToTri.has(k)) { const j = edgeToTri.get(k); triData[ti].nbr.add(j); triData[j].nbr.add(ti); } else edgeToTri.set(k, ti); } }); const isShallow = (h) => h >= 0.35 && h < seaLevel; const isSnow = (h) => h >= 0.85; const nearBorder = (p) => (p.x < 10 || p.x > W - 10 || p.y < 10 || p.y > H - 10); const snowIdx = []; const coastIdx = []; for (let i = 0; i < triData.length; i++) { const h = triData[i].h; if (isSnow(h)) snowIdx.push(i); if (isShallow(h) && nearBorder(triData[i].center)) coastIdx.push(i); } if (snowIdx.length === 0 || coastIdx.length === 0) return rivers;
+        const astar = (start, end) => { const open = new Set([start]); const came = new Map(); const g = new Map([[start, 0]]); const f = new Map([[start, 0]]); const hfun = (i) => { const a = triData[i].center, b = triData[end].center; return Math.hypot(a.x - b.x, a.y - b.y); }; while (open.size) { let cur = -1, cf = Infinity; for (const i of open) { const fi = f.get(i) ?? Infinity; if (fi < cf) { cf = fi; cur = i; } } if (cur === end) { const path = []; let u = cur; while (u !== undefined) { path.push(u); u = came.get(u); } return path.reverse(); } open.delete(cur); for (const nb of triData[cur].nbr) { const dh = Math.max(0, triData[cur].h - triData[nb].h); const curC = triData[cur].center; const nbC = triData[nb].center; const prev = came.get(cur); let bendPenalty = 0; if (prev !== undefined) { const prevC = triData[prev].center; const v1x = curC.x - prevC.x, v1y = curC.y - prevC.y; const v2x = nbC.x - curC.x, v2y = nbC.y - curC.y; const cross = v1x * v2y - v1y * v2x; if (cross !== 0) bendPenalty = 0.03; } const tent = (g.get(cur) || 0) + 1 - dh * 0.2 + bendPenalty; if (tent < (g.get(nb) ?? Infinity)) { came.set(nb, cur); g.set(nb, tent); f.set(nb, tent + hfun(nb)); open.add(nb); } } } return null; };
+        function hashInt(a, b) { let n = (a * 374761393) ^ (b * 668265263); n = (n ^ (n >>> 13)) >>> 0; n = (n * 1274126177) >>> 0; return n >>> 0; }
+        const meanderCurve = (poly, levels, amp, seed) => { if (poly.length < 2) return poly; const pts0 = poly.map(p => ({ x: p.x, y: p.y })); const segLen = []; let total = 0; for (let i = 0; i < pts0.length - 1; i++) { const a = pts0[i], b = pts0[i + 1]; const L = Math.hypot(b.x - a.x, b.y - a.y) || 1e-6; segLen.push(L); total += L; } if (total <= 1e-6) return pts0; const N = Math.max(64, Math.min(1024, pts0.length * 8)); const rng = lcg(seed ^ 0x9e3779b9); const baseFreq = 0.8 + rng() * 0.6; const raw = new Float32Array(N); for (let i = 0; i < N; i++) { const t = i / (N - 1); raw[i] = fbm1D(this.noise, t * baseFreq, 4, 2.0, 0.5); } const blurred = gaussianBlur1D(raw, Math.max(3, (N / 24) | 0)); const band = new Float32Array(N); for (let i = 0; i < N; i++) band[i] = raw[i] - blurred[i]; let jit = normalizeUnit(band); const KMAX = 12.0, FLIP_W = Math.max(8, (N / 40) | 0); let K = 0; for (let i = 1; i < N; i++) { const sgn = Math.sign(jit[i]); K += sgn * 0.5; if (Math.abs(K) > KMAX) { const a = Math.max(0, i - FLIP_W), b = Math.min(N - 1, i + FLIP_W); for (let k = a; k <= b; k++) jit[k] = -jit[k]; K = 0; } } let pts = pts0; const tangFrac = 0.05; for (let L = 0; L < levels; L++) { const decay = amp * Math.pow(0.6, L + 1); const next = [{ x: pts[0].x, y: pts[0].y }]; let acc = 0; for (let i = 0; i < pts.length - 1; i++) { const a = pts[i], b = pts[i + 1]; const dx = b.x - a.x, dy = b.y - a.y; const Lseg = Math.hypot(dx, dy) || 1; const px = -dy / Lseg, py = dx / Lseg; const midS = (acc + Lseg * 0.5) / (total || 1); const ji = jit[Math.min(N - 1, Math.max(0, Math.round(midS * (N - 1))))]; const off = ji * decay * 12; const tang = ji * decay * 6 * tangFrac; const mx = (a.x + b.x) * 0.5, my = (a.y + b.y) * 0.5; const tx = dx / Lseg, ty = dy / Lseg; next.push({ x: mx + px * off + tx * tang, y: my + py * off + ty * tang }); next.push({ x: b.x, y: b.y }); acc += Lseg; } pts = next; } for (let s = 0; s < 2; s++) { const sm = [pts[0]]; for (let i = 1; i < pts.length - 1; i++) { sm.push({ x: 0.25 * pts[i - 1].x + 0.5 * pts[i].x + 0.25 * pts[i + 1].x, y: 0.25 * pts[i - 1].y + 0.5 * pts[i].y + 0.25 * pts[i + 1].y }); } sm.push(pts[pts.length - 1]); pts = sm; } return pts; };
+        const drawPath = (pts, w) => { const idx = (x, y) => y * W + x; const inB = (x, y) => x >= 0 && y >= 0 && x < W && y < H; for (let i = 0; i < pts.length - 1; i++) { const a = pts[i], b = pts[i + 1]; const dx = b.x - a.x, dy = b.y - a.y; const dist = Math.hypot(dx, dy); const steps = Math.max(2, Math.ceil(dist * 1.5)); for (let s = 0; s <= steps; s++) { const t = s / steps; const x = a.x + dx * t, y = a.y + dy * t; const r = w; const minX = Math.floor(x - r - 1), maxX = Math.ceil(x + r + 1); const minY = Math.floor(y - r - 1), maxY = Math.ceil(y + r + 1); for (let yy = minY; yy <= maxY; yy++) for (let xx = minX; xx <= maxX; xx++) { if (!inB(xx, yy)) continue; const d = Math.hypot(xx - x, yy - y); if (d <= r) { const fall = 1 - (d / r); this.riverMap[idx(xx, yy)] = Math.max(this.riverMap[idx(xx, yy)], fall * w); } } } } }; let attempts = 0, built = 0; const usedPairs = new Set(); while (built < count && attempts < count * 40) { attempts++; const s = snowIdx[(Math.random() * snowIdx.length) | 0]; const e = coastIdx[(Math.random() * coastIdx.length) | 0]; const key = s + ':' + e; if (usedPairs.has(key)) continue; const pathIdx = astar(s, e); if (!pathIdx || pathIdx.length < 3) continue; usedPairs.add(key); const coarse = pathIdx.map(i => triData[i].center); const seed = hashInt(s, e); const squig = meanderCurve(coarse, fractalLevels, meander, seed); drawPath(squig, Math.max(0.2, width)); rivers.push({ type: 'main', path: squig }); built++; } return rivers;
+      }
+      carveRiverbeds({ depth = 0.035, radius = 2, iterations = 2 } = {}) { const W = this.width, H = this.height; let dep = new Float32Array(this.riverMap); const tmp = new Float32Array(dep.length); const idx = (x, y) => y * W + x; const weight = (dx, dy) => 1 / (1 + Math.abs(dx) + Math.abs(dy)); for (let it = 0; it < iterations; it++) { tmp.fill(0); for (let y = radius; y < H - radius; y++) { for (let x = radius; x < W - radius; x++) { let s = 0, w = 0; for (let dy = -radius; dy <= radius; dy++) { for (let dx = -radius; dx <= radius; dx++) { const ww = weight(dx, dy); s += dep[idx(x + dx, y + dy)] * ww; w += ww; } } tmp[idx(x, y)] = s / (w || 1); } } const t = dep; dep = tmp; tmp.set(t); } let mx = 0; for (let i = 0; i < dep.length; i++) if (dep[i] > mx) mx = dep[i]; const scale = mx > 0 ? (1 / mx) : 0; for (let i = 0; i < dep.length; i++) dep[i] *= scale; for (let i = 0; i < this.heightmap.length; i++) { const d = dep[i]; if (d > 0) { this.heightmap[i] = Math.max(0, this.heightmap[i] - depth * d); } } this._boxBlur(1); }
+      scaleMountains(intensity) { const base = 0.55, gain = 1 + intensity; for (let i = 0; i < this.heightmap.length; i++) { let h = this.heightmap[i]; if (h > base) { const t = (h - base) / (1 - base); const smooth = Math.pow(t, 0.8); h = base + smooth * (1 - base) * gain; this.heightmap[i] = Math.min(1, Math.max(0, h)); } } }
+      normalize() { let mn = Infinity, mx = -Infinity; for (let i = 0; i < this.heightmap.length; i++) { mn = Math.min(mn, this.heightmap[i]); mx = Math.max(mx, this.heightmap[i]); } const r = mx - mn; if (r > 0) { for (let i = 0; i < this.heightmap.length; i++) { this.heightmap[i] = (this.heightmap[i] - mn) / r; } } }
+      adjustSeaLevel(p) { const s = Array.from(this.heightmap).sort((a, b) => a - b); const cut = s[Math.floor(s.length * p)]; for (let i = 0; i < this.heightmap.length; i++) { this.heightmap[i] = (this.heightmap[i] - cut) / (1 - cut); if (this.heightmap[i] < 0) this.heightmap[i] *= 0.5; } }
+    }
+
+    // ===== Discrete theme & function =====
+    const themes = { satellite: { deepWater: [25, 55, 109], shallowWater: [65, 105, 160], river: [58, 99, 153], sand: [194, 178, 128], grass: [86, 125, 70], forest: [57, 87, 48], rock: [139, 119, 90], snow: [230, 230, 230] } };
+    const SEA_LEVEL = 0.48;
+
+    function getColorDiscrete(h, isRiver) {
+      const c = themes.satellite;
+      if (h < 0.35) return c.deepWater;
+      if (h < SEA_LEVEL) return c.shallowWater;
+      if (isRiver) return c.river;
+      if (h < 0.5) return c.sand;
+      if (h < 0.6) return c.grass;
+      if (h < 0.7) return c.forest;
+      if (h < 0.85) return c.rock;
+      return c.snow;
+    }
+
+    // ===== Continuous coloring: simple split at SEA_LEVEL =====
+    function computeSeaLandEnds(hm, sea = SEA_LEVEL) {
+      let wMin = Infinity, lMax = -Infinity;
+      for (let i = 0; i < hm.length; i++) {
+        const h = hm[i];
+        if (h <= sea) { if (h < wMin) wMin = h; }
+        else { if (h > lMax) lMax = h; }
+      }
+      if (wMin === Infinity) wMin = sea;  // no water edge case
+      if (lMax === -Infinity) lMax = sea; // no land edge case
+      return { wMin, lMax };
+    }
+
+    function getColorContinuous(h, isRiver, spans) {
+      // Rivers on by default, same semantics as discrete: paint river color on land
+      if (isRiver) return themes.satellite.river;
+
+      const { wMin, lMax } = spans;
+      const sea = SEA_LEVEL;
+
+      if (h <= sea) {
+        const denom = Math.max(1e-9, sea - wMin);
+        const t = Math.max(0, Math.min(1, (h - wMin) / denom));
+        const idx = Math.floor(t * (WATER_LUT.length - 1));
+        return WATER_LUT[idx];
+      } else {
+        const denom = Math.max(1e-9, lMax - sea);
+        const t = Math.max(0, Math.min(1, (h - sea) / denom));
+        const idx = Math.floor(t * (LAND_LUT.length - 1));
+        return LAND_LUT[idx];
+      }
+    }
+
+    // ===== Globals =====
+    let mapGenerator, currentRivers = [], OUTPUT_SIZE = 1024;
+
+    function calculateStatistics(sea) {
+      if (!mapGenerator || !mapGenerator.heightmap) return;
+      let land = 0, hi = -Infinity; const total = mapGenerator.heightmap.length;
+      for (let i = 0; i < total; i++) { const h = mapGenerator.heightmap[i]; if (h > sea) { land++; if (h > hi) hi = h; } }
+      const pct = total ? (land / total) * 100 : 0;
+      const meters = (hi === -Infinity ? 0 : Math.max(0, Math.floor(hi * 8848)));
+      document.getElementById('landCoverage').textContent = pct.toFixed(1) + '%';
+      document.getElementById('highestPeak').textContent = meters + 'm';
+      document.getElementById('activeRivers').textContent = Array.isArray(currentRivers) ? currentRivers.length : 0;
+    }
+
+    function generateMap() {
+      const loading = document.getElementById('loading'); loading.style.display = 'block';
+      setTimeout(() => {
+        const cells = parseInt(document.getElementById('mapSize').value);
+        const numPlates = 1;
+        const waterPct = parseInt(document.getElementById('waterLevel').value) / 100;
+        const mountainIntensity = parseInt(document.getElementById('mountainIntensity').value) / 100;
+        const erosionCycles = parseInt(document.getElementById('erosionStrength').value);
+        const riverCount = parseInt(document.getElementById('riverCount').value);
+        const mapType = document.getElementById('mapType').value;
+
+        mapGenerator = new MapGenerator(cells, cells);
+        mapGenerator.generateBaseTerrain();
+        if (mapType === 'island') {
+          mapGenerator.applyIslandMask(); mapGenerator.normalize(); mapGenerator.adjustSeaLevel(waterPct);
+        } else {
+          mapGenerator.addTectonicFeatures(numPlates);
+          if (mapType === 'continent') { mapGenerator.applyContinentMask(); mapGenerator.setInteriorSeaLevel(waterPct); }
+          else { mapGenerator.normalize(); }
+          if (erosionCycles > 0) mapGenerator.applyErosion(erosionCycles);
+          if (mapType === 'archipelago') mapGenerator.adjustSeaLevel(waterPct);
+          mapGenerator.scaleMountains(mountainIntensity);
+          if (mapType !== 'continent') mapGenerator.normalize();
+        }
+        currentRivers = mapGenerator.generateRiversDelaunay({
+          count: riverCount, seaLevel: SEA_LEVEL,
+          meander: parseInt(document.getElementById('riverMeander').value) / 100,
+          fractalLevels: parseInt(document.getElementById('fractalLevels').value),
+          width: parseFloat(document.getElementById('riverWidth').value)
+        });
+        mapGenerator.carveRiverbeds({ depth: 0.035, radius: 2, iterations: 2 });
+
+        calculateStatistics(SEA_LEVEL);
+        renderMap();
+        loading.style.display = 'none';
+      }, 30);
+    }
+
+    function renderMap() {
+      const canvas = document.getElementById('mapCanvas'); const ctx = canvas.getContext('2d');
+      const res = parseInt(document.getElementById('mapResolution').value);
+      const targetSize = Math.max(res, OUTPUT_SIZE);
+      const cells = mapGenerator.width;
+
+      // Buffer size only (visible panel stays fixed 1024×1024)
+      canvas.width = targetSize; canvas.height = targetSize;
+
+      const off = document.createElement('canvas'); off.width = cells; off.height = cells; const octx = off.getContext('2d', { willReadFrequently: true });
+      const img = octx.createImageData(off.width, off.height); const data = img.data;
+      const useCM = document.getElementById('modeColormap').checked;
+
+      const spans = computeSeaLandEnds(mapGenerator.heightmap, SEA_LEVEL);
+
+      for (let y = 0; y < cells; y++) {
+        for (let x = 0; x < cells; x++) {
+          const i = y * cells + x; const h = mapGenerator.heightmap[i];
+          const rmv = mapGenerator.riverMap[i];
+          const isRiver = (rmv > 0 && h > SEA_LEVEL);
+
+          const col = useCM
+            ? getColorContinuous(h, isRiver, spans)
+            : getColorDiscrete(h, isRiver);
+
+          const p = i * 4;
+          data[p] = col[0]; data[p + 1] = col[1]; data[p + 2] = col[2]; data[p + 3] = 255;
+        }
+      }
+
+      if (document.getElementById('sharpenToggle').checked) { sharpenImageData(img, off.width, off.height, 1.0); }
+      octx.putImageData(img, 0, 0);
+
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+
+      updateLegend(useCM);
+    }
+
+    function sharpenImageData(imageData, w, h, amount = 1.0) {
+      const src = imageData.data, out = new Uint8ClampedArray(src.length), idx = (x, y) => (y * w + x) * 4;
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          const p = idx(x, y);
+          for (let c = 0; c < 3; c++) {
+            const center = src[p + c] * (1 + 4 * amount), up = src[idx(x, y - 1) + c] * (-amount), down = src[idx(x, y + 1) + c] * (-amount), left = src[idx(x - 1, y) + c] * (-amount), right = src[idx(x + 1, y) + c] * (-amount);
+            out[p + c] = Math.max(0, Math.min(255, center + up + down + left + right));
+          }
+          out[p + 3] = src[p + 3];
+        }
+      }
+      for (let x = 0; x < w; x++) { const t = idx(x, 0), b = idx(x, h - 1); for (let c = 0; c < 4; c++) { out[t + c] = src[t + c]; out[b + c] = src[b + c]; } }
+      for (let y = 0; y < h; y++) { const l = idx(0, y), r = idx(w - 1, y); for (let c = 0; c < 4; c++) { out[l + c] = src[l + c]; out[r + c] = src[r + c]; } }
+      imageData.data.set(out);
+    }
+
+    function updateLegend(useCM) {
+      const legend = document.getElementById('legend'); legend.innerHTML = '';
+      const title = document.createElement('h4'); title.style.marginBottom = '8px';
+
+      if (useCM) {
+        title.textContent = `Elevation (split @ ${Math.round(SEA_LEVEL * 100)}%)`;
+        legend.appendChild(title);
+
+        const makeGrad = (lut) => {
+          const grad = document.createElement('canvas'); grad.width = 180; grad.height = 16;
+          const gctx = grad.getContext('2d'); const img = gctx.createImageData(180, 16); const data = img.data;
+          for (let x = 0; x < 180; x++) {
+            const t = x / 179; const idx = Math.floor(t * (lut.length - 1)); const c = lut[idx];
+            for (let y = 0; y < 16; y++) {
+              const p = (y * 180 + x) * 4; data[p] = c[0]; data[p + 1] = c[1]; data[p + 2] = c[2]; data[p + 3] = 255;
+            }
+          }
+          gctx.putImageData(img, 0, 0); return grad.toDataURL();
+        };
+
+        const rows = [
+          ['Water (wMin → SEA_LEVEL)', makeGrad(WATER_LUT)],
+          ['Land (SEA_LEVEL → lMax)', makeGrad(LAND_LUT)],
+        ];
+
+        for (const [name, url] of rows) {
+          const row = document.createElement('div'); row.className = 'legend-item';
+          const chip = document.createElement('div'); chip.className = 'legend-color';
+          chip.style.width = '190px'; chip.style.height = '18px'; chip.style.border = 'none';
+          chip.style.backgroundImage = `url(${url})`; chip.style.backgroundSize = '100% 100%';
+          row.appendChild(chip); row.appendChild(Object.assign(document.createElement('span'), { textContent: name }));
+          legend.appendChild(row);
+        }
+      } else {
+        title.textContent = 'Discrete palette';
+        legend.appendChild(title);
+        const rows = [
+          ['Deep Water', [25, 55, 109]],
+          ['Shallow Water', [65, 105, 160]],
+          ['Rivers', [58, 99, 153]],
+          ['Sand', [194, 178, 128]],
+          ['Grass', [86, 125, 70]],
+          ['Forest', [57, 87, 48]],
+          ['Rock', [139, 119, 90]],
+          ['Snow', [230, 230, 230]],
+        ];
+        for (const [name, col] of rows) {
+          const div = document.createElement('div'); div.className = 'legend-item';
+          const chip = document.createElement('div'); chip.className = 'legend-color'; chip.style.background = `rgb(${col.join(',')})`;
+          div.appendChild(chip); div.appendChild(Object.assign(document.createElement('span'), { textContent: name }));
+          legend.appendChild(div);
+        }
+      }
+    }
+
+    // ===== UI =====
+    function initUI() {
+      document.getElementById('mapType').addEventListener('change', (e) => {
+        const label = document.getElementById('waterLevelLabel'); const v = document.getElementById('waterLevel').value;
+        label.innerHTML = (e.target.value === 'continent'
+          ? `Lake/Sea Amount (%) <span class="value-display" id="waterValue">${v}</span>`
+          : `Sea Level (%) <span class="value-display" id="waterValue">${v}</span>`);
+      });
+      document.getElementById('mapSize').addEventListener('input', (e) => { document.getElementById('sizeValue').textContent = e.target.value; });
+
+      const outSizeEl = document.getElementById('outputSize');
+      const applyOutputSize = () => { const px = parseInt(outSizeEl.value); OUTPUT_SIZE = px; document.getElementById('outSizeValue').textContent = px; if (mapGenerator) renderMap(); };
+      outSizeEl.addEventListener('input', applyOutputSize); applyOutputSize();
+
+      document.getElementById('mapResolution').addEventListener('input', (e) => { document.getElementById('resValue').textContent = e.target.value; });
+      document.getElementById('waterLevel').addEventListener('input', (e) => { document.getElementById('waterValue').textContent = e.target.value; });
+      document.getElementById('mountainIntensity').addEventListener('input', (e) => { document.getElementById('mountainValue').textContent = e.target.value; });
+      document.getElementById('erosionStrength').addEventListener('input', (e) => { document.getElementById('erosionValue').textContent = e.target.value; });
+      document.getElementById('riverCount').addEventListener('input', (e) => { document.getElementById('riverValue').textContent = e.target.value; });
+      document.getElementById('riverMeander').addEventListener('input', (e) => { document.getElementById('meanderValue').textContent = (e.target.value / 100).toFixed(2); });
+      document.getElementById('fractalLevels').addEventListener('input', (e) => { document.getElementById('fractalValue').textContent = e.target.value; });
+      document.getElementById('riverWidth').addEventListener('input', (e) => { document.getElementById('widthValue').textContent = parseFloat(e.target.value).toFixed(1); });
+
+      document.getElementById('modeColormap').addEventListener('change', () => { if (mapGenerator) renderMap(); });
+
+      window.addEventListener('load', generateMap);
+    }
+    if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', initUI); } else { initUI(); }
+
+    // ===== Tests =====
+    function runTests() {
+      console.group('Tectonic Map Generator – Tests');
+      try {
+        const vc = document.querySelector('.view-container');
+        const beforeW = getComputedStyle(vc).width, beforeH = getComputedStyle(vc).height;
+        console.assert(beforeW === '1024px' && beforeH === '1024px', 'Container fixed 1024×1024.');
+        const canvas = document.getElementById('mapCanvas');
+        const outEl = document.getElementById('outputSize');
+        outEl.value = 1408; outEl.dispatchEvent(new Event('input'));
+        console.assert(canvas.width === 1408, 'Canvas buffer follows Output Size.');
+        console.assert(getComputedStyle(vc).width === beforeW && getComputedStyle(vc).height === beforeH, 'Output size does not change container.');
+        console.log('%cAll tests executed.', 'color:#2d3748');
+      } catch (err) { console.error('Test run error:', err); } finally { console.groupEnd(); }
+    }
+  </script>
+</body>
+</html>
