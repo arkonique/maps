@@ -689,7 +689,8 @@
         const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2, x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2, ii = i & 255, jj = j & 255, gi0 = this.perm[ii + this.perm[jj]] % 12, gi1 = this.perm[ii + i1 + this.perm[jj + j1]] % 12, gi2 = this.perm[ii + 1 + this.perm[jj + 1]] % 12;
         let t0 = 0.5 - x0 * x0 - y0 * y0; let n0 = t0 < 0 ? 0 : ((t0 *= t0) * t0 * this.dot(this.grad3[gi0], x0, y0));
         let t1 = 0.5 - x1 * x1 - y1 * y1; let n1 = t1 < 0 ? 0 : ((t1 *= t1) * t1 * this.dot(this.grad3[gi1], x1, y1));
-        let t2 = 0.5 - x2 * x2 - y2 * y2; let n2 = t2 < 0 ? 0 : ((t2 *= t2) * t2 * this.dot(this.grad3[gi2], x2, y2));
+        let t2 = 0.5 - x2 * x2 - y2 * y2; let n2 = t2 < 0 ? 0 : ((t2 *= t0), 0); // unused var silence
+        n2 = 0.5 - x2 * x2 - y2 * y2; n2 = n2 < 0 ? 0 : ((n2 *= n2) * n2 * this.dot(this.grad3[gi2], x2, y2));
         return 70 * (n0 + n1 + n2);
       }
     }
@@ -756,7 +757,6 @@
     }
 
     function getColorContinuous(h, isRiver, spans) {
-      // Rivers on by default, same semantics as discrete: paint river color on land
       if (isRiver) return themes.satellite.river;
 
       const { wMin, lMax } = spans;
@@ -773,6 +773,80 @@
         const idx = Math.floor(t * (LAND_LUT.length - 1));
         return LAND_LUT[idx];
       }
+    }
+
+    // ===== NEW: Coastline outline helpers (thin + crisp) =====
+    function buildCoastMask(hm, W, H, seaLevel, radiusCells = 0) {
+      const coast = new Uint8Array(W * H);
+      const idx = (x, y) => y * W + x;
+
+      // Mark boundary where land touches water (8-neighborhood)
+      for (let y = 1; y < H - 1; y++) {
+        for (let x = 1; x < W - 1; x++) {
+          const i = idx(x, y);
+          const land = hm[i] > seaLevel;
+          let touches = false;
+          for (let dy = -1; dy <= 1 && !touches; dy++) {
+            for (let dx = -1; dx <= 1 && !touches; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const j = idx(x + dx, y + dy);
+              if ((hm[j] > seaLevel) !== land) touches = true;
+            }
+          }
+          if (touches) coast[i] = 1;
+        }
+      }
+
+      if (radiusCells <= 0) return coast;
+
+      // Optional light dilation
+      const out = new Uint8Array(coast.length);
+      const r = radiusCells;
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          if (!coast[idx(x, y)]) continue;
+          for (let dy = -r; dy <= r; dy++) {
+            for (let dx = -r; dx <= r; dx++) {
+              const xx = x + dx, yy = y + dy;
+              if (xx >= 0 && yy >= 0 && xx < W && yy < H) out[idx(xx, yy)] = 1;
+            }
+          }
+        }
+      }
+      return out;
+    }
+
+    function drawCoastlineOverlay(octx, hm, cells, targetSize, seaLevel) {
+      // Target very thin line (~0.75px at final output)
+      const scale = targetSize / cells;
+      const desiredPx = 0.2;
+
+      // Allow radius=0 for razor-thin look on high scales
+      const radiusCells = Math.max(0, Math.floor(desiredPx / scale));
+
+      const W = cells, H = cells;
+      const mask = buildCoastMask(hm, W, H, seaLevel, radiusCells);
+
+      const overlay = document.createElement('canvas');
+      overlay.width = W; overlay.height = H;
+      const o2 = overlay.getContext('2d', { willReadFrequently: true });
+      const id = o2.createImageData(W, H);
+      const d = id.data;
+
+      for (let i = 0; i < mask.length; i++) {
+        if (mask[i]) {
+          const p = i * 4;
+          d[p] = 0; d[p + 1] = 0; d[p + 2] = 0; d[p + 3] = 255;
+        }
+      }
+      o2.putImageData(id, 0, 0);
+
+      // Composite over the offscreen render; keep pixels crisp pre-upscale
+      octx.save();
+      octx.globalCompositeOperation = 'source-over';
+      octx.imageSmoothingEnabled = false;
+      octx.drawImage(overlay, 0, 0);
+      octx.restore();
     }
 
     // ===== Globals =====
@@ -860,6 +934,10 @@
       if (document.getElementById('sharpenToggle').checked) { sharpenImageData(img, off.width, off.height, 1.0); }
       octx.putImageData(img, 0, 0);
 
+      // >>> NEW: draw thin, sharp black coastline overlay
+      drawCoastlineOverlay(octx, mapGenerator.heightmap, cells, targetSize, SEA_LEVEL);
+
+      // Upscale to visible canvas
       ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(off, 0, 0, canvas.width, canvas.height);

@@ -5,6 +5,7 @@ from scipy.ndimage import (
     gaussian_filter,
     convolve,
     maximum_filter,
+    label,  # C-optimized component labeling
 )
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -128,7 +129,7 @@ def heightmap_xyz_to_grid(heightmap_xyz, H=None, W=None, dtype=np.float32):
     return h_raw
 
 # =========================================================
-# Full simulation — fast & feature-complete (+ Exodus)
+# Full simulation — fast & feature-complete (+ Exodus + Military)
 # =========================================================
 def simulate_population_from_heightmap(
     heightmap_xyz,
@@ -143,8 +144,7 @@ def simulate_population_from_heightmap(
     kappa_water_capacity=1.0, lambda_water_capacity=8.0,  # capacity uplift decay from water
     # attractiveness (directed flow) — includes sand corridor & stronger water pull
     alpha_w=1.6, alpha_p=1.0, alpha_b=0.5, lambda_mig=8.0,
-    water_affinity_gain=0.35,        # extra multiplicative boost on S_w before exponent
-    sand_corridor_boost=0.50,        # destination-side boost for sand near water
+    water_affinity_gain=0.35, sand_corridor_boost=0.50, sand_mask_weight=None,
     density_sigma=1.8, rho_half=1800.0, pref_noise_sigma=0.12,
     # migration & flows (one-step each)
     m_dir=0.05,                      # directed (A_att)
@@ -174,17 +174,24 @@ def simulate_population_from_heightmap(
     town_threshold=2500.0, culture_radius=1, culture_persist_years=25,
     culture_min_abs=800.0, culture_min_frac=0.06,
 
-    # ------------------ EXODUS (new) ------------------
+    # ------------------ EXODUS ------------------
     exodus_enabled=True,
-    exodus_prob=0.06,                # chance each year to trigger exodus events
-    exodus_events_mean=1.0,          # Poisson mean #events when triggered
-    exodus_min_pop=None,             # None → defaults to town_threshold
-    exodus_group_frac=0.25,          # fraction of source pop that leaves
-    exodus_min_dist=20,              # Chebyshev distance (cells)
-    exodus_max_dist=None,            # optional max distance (None=unbounded)
-    exodus_target_bias_water=1.0,    # 0=ignore water, 1=prefer nearer water using S_w
-    exodus_target_bias_empty=0.7,    # 0=ignore emptiness, >0=prefer emptier (uses 1 - S_pop)
-    exodus_culture_factor=0.5,       # seed culture counter with this * culture_persist_years
+    exodus_prob=0.06, exodus_events_mean=1.0,
+    exodus_min_pop=None, exodus_group_frac=0.25,
+    exodus_min_dist=20, exodus_max_dist=None,
+    exodus_target_bias_water=1.0, exodus_target_bias_empty=0.7,
+    exodus_culture_factor=0.5,
+    # ---------------------------------------------------
+
+    # ------------------ MILITARY (sim-owned) ------------------
+    military_enabled=True,                  # maintain per-cell stance in sim
+    record_military=False,                  # store snapshots (aligned with save_every)
+    military_init="random",                 # "random" init in [-1,1]
+    military_forcing_enabled=False,         # periodic anti-neutral push
+    military_neutral_band=0.08,             # |stance| <= band is "neutral"
+    military_period=24,                     # frames/years per cycle
+    military_strength=0.5,                  # max push per step (scaled by envelope & room)
+    military_shape="sin",                   # "sin" | "saw" | "linear"
     # ---------------------------------------------------
 
     # run control
@@ -250,15 +257,32 @@ def simulate_population_from_heightmap(
     else:
         culture_counter = culture_anchor = None
 
+    # ---- MILITARY per-cell state (sim-owned) ----
+    if military_enabled:
+        if military_init == "random":
+            M_cell = rng.uniform(-1.0, 1.0, size=(H, W)).astype(np.float32)
+        else:
+            M_cell = rng.uniform(-1.0, 1.0, size=(H, W)).astype(np.float32)
+        M_cell[water_mask] = 0.0
+        M_runlen = np.zeros((H, W), dtype=np.int32)  # neutral streak length
+        # deterministic fallback sign for cells where stance==0
+        M_seed_sign = np.where(rng.integers(0, 2, size=(H, W), endpoint=False) == 0, -1, 1).astype(np.int8)
+        M_seed_sign[water_mask] = 0
+    else:
+        M_cell = M_runlen = M_seed_sign = None
+
     # ---- histories ----
     pop_history = []
     att_history = [] if record_attractiveness else None
+    mil_history = [] if (military_enabled and record_military) else None
 
-    def maybe_store(t, arr_pop, arr_att=None):
+    def maybe_store(t, arr_pop, arr_att=None, arr_mil=None):
         if t % save_every == 0:
             pop_history.append(arr_pop.copy())
             if record_attractiveness and (arr_att is not None):
                 att_history.append(arr_att.copy())
+            if mil_history is not None and (arr_mil is not None):
+                mil_history.append(arr_mil.copy())
 
     # ---- compute baseline A_att for t=0 (no infra, no shocks, no life; memory=0) ----
     S_w_eff0 = np.clip(S_w * (1.0 + water_affinity_gain), 0.0, None) ** dtype(alpha_w)
@@ -270,7 +294,9 @@ def simulate_population_from_heightmap(
     A_base0  = (S_w_eff0 * (S_pop0 ** dtype(alpha_p)) * (W_bio_mig ** dtype(alpha_b)) * crowd_t0 * (1.0 + 0.5 * mem_t0))
     A_sand_b0= (biome == 1).astype(dtype) * S_w_eff0 * dtype(sand_corridor_boost)
     A_att0   = A_base0 * (1.0 + A_sand_b0)
-    maybe_store(0, N, A_att0)
+
+    # t=0 snapshots
+    maybe_store(0, N, A_att0, (M_cell if military_enabled and record_military else None))
 
     # -------- Catastrophes defaults --------
     if catastrophe_types is None:
@@ -291,6 +317,7 @@ def simulate_population_from_heightmap(
     # Precompute coordinate grids for exodus distance checks
     yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
 
+    # ---- helpers (local) ----
     def sample_region_mask():
         flat = N.ravel(); tot = flat.sum()
         if tot <= 0:
@@ -330,6 +357,21 @@ def simulate_population_from_heightmap(
                 "K_mult": float(p["K_mult"]),
                 "m_dir_mult": float(p["m_dir_mult"]),
             })
+
+    def _military_envelope(runlen):
+        if not military_forcing_enabled:
+            return 0.0
+        if military_period <= 1:
+            phase = 1.0
+        else:
+            phase = (runlen % military_period).astype(np.float32) / float(military_period)
+        if military_shape == "sin":
+            env = np.sin(np.pi * phase)
+        elif military_shape == "saw":
+            env = phase
+        else:
+            env = np.where(phase <= 0.5, 2.0*phase, 2.0*(1.0 - phase)).astype(np.float32)
+        return np.clip(env, 0.0, 1.0)
 
     # =========================
     # Yearly loop (vectorized)
@@ -474,16 +516,15 @@ def simulate_population_from_heightmap(
         if clip_negative: N_next[N_next < 0] = 0
         N_next[water_mask] = 0
 
-        # ------------------ EXODUS (new) ------------------
+        # ------------------ EXODUS ------------------
         if exodus_enabled and rng.random() < exodus_prob:
             k_events = max(1, rng.poisson(exodus_events_mean))
             min_pop = float(town_threshold if exodus_min_pop is None else exodus_min_pop)
-            # Use S_pop (from current rho) to bias toward emptier targets if requested
-            # S_pop computed earlier from N (pre-flows); recompute quickly for N_next for better target choice:
+            # bias field from current N_next
             rho_next = gaussian_filter(N_next.astype(np.float32), sigma=density_sigma, mode="reflect").astype(dtype)
             S_pop_next = rho_next / (rho_next + dtype(rho_half))
 
-            # candidate sources: sufficiently large, on land
+            # candidate sources
             cand = (N_next >= min_pop) & (~water_mask)
             if np.any(cand):
                 src_probs = (N_next * cand).ravel()
@@ -494,34 +535,30 @@ def simulate_population_from_heightmap(
                         sidx = rng.choice(H*W, p=src_probs)
                         sy, sx = divmod(sidx, W)
                         src_pop = float(N_next[sy, sx])
-                        if src_pop < min_pop:  # re-check (may have changed)
+                        if src_pop < min_pop:
                             continue
                         group = max(1.0, exodus_group_frac * src_pop)
                         N_next[sy, sx] = max(0.0, src_pop - group)
 
-                        # target mask: land, far enough (Chebyshev), optionally <= max
                         dist = np.maximum(np.abs(yy - sy), np.abs(xx - sx))
                         target_mask = (~water_mask) & (dist >= int(exodus_min_dist))
                         if exodus_max_dist is not None:
                             target_mask &= (dist <= int(exodus_max_dist))
 
-                        # weights: ignore biome preference; optionally prefer near-water and emptier cells
                         if exodus_target_bias_water > 0 or exodus_target_bias_empty > 0:
                             w = np.ones((H, W), dtype=np.float64)
                             if exodus_target_bias_water > 0:
-                                w *= (1e-6 + S_w) ** float(exodus_target_bias_water)
+                                w *= (1e-6 + S_w)
                             if exodus_target_bias_empty > 0:
-                                w *= (1e-6 + (1.0 - S_pop_next)) ** float(exodus_target_bias_empty)
+                                w *= (1e-6 + (1.0 - S_pop_next))
                         else:
                             w = np.ones((H, W), dtype=np.float64)
 
                         w *= target_mask.astype(np.float64)
                         wsum = w.sum()
                         if wsum <= 0:
-                            # fallback: any land far enough, uniform
                             fallback = np.where(target_mask.ravel())[0]
                             if fallback.size == 0:
-                                # nothing valid, return group to source
                                 N_next[sy, sx] += group
                                 continue
                             tidx = int(rng.choice(fallback))
@@ -532,12 +569,9 @@ def simulate_population_from_heightmap(
                         ty, tx = divmod(tidx, W)
                         N_next[ty, tx] += group
 
-                        # accelerated culture at the destination
                         if culture_enabled:
                             boost = int(max(0, round(exodus_culture_factor * culture_persist_years)))
-                            # Seed the counter so it “arrives” earlier to anchorhood
                             culture_counter[ty, tx] = max(culture_counter[ty, tx], boost)
-        # ---------------------------------------------------
 
         # ===== CULTURE: update & enforce floor =====
         if culture_enabled:
@@ -549,52 +583,114 @@ def simulate_population_from_heightmap(
             floor = np.maximum(culture_min_abs, culture_min_frac * K_eff)
             N_next = np.where(culture_anchor & (~water_mask), np.maximum(N_next, floor), N_next)
 
+        # ---- MILITARY periodic forcing (sim-time) ----
+        if military_enabled and military_forcing_enabled:
+            neutral = (np.abs(M_cell) <= float(military_neutral_band))
+            M_runlen = np.where(neutral, M_runlen + 1, 0)
+            env = _military_envelope(M_runlen).astype(np.float32)
+            sgn = np.sign(M_cell).astype(np.int8)
+            sgn = np.where(sgn == 0, M_seed_sign, sgn).astype(np.int8)
+            room = (1.0 - np.clip(np.abs(M_cell), 0.0, 1.0)).astype(np.float32)
+            delta = (military_strength * env * room).astype(np.float32)
+            M_cell = np.clip(M_cell + (sgn.astype(np.float32) * delta), -1.0, 1.0)
+            M_cell[water_mask] = 0.0
+
         # Expire shocks
         if active_shocks:
             for sh in active_shocks: sh["years_left"] -= 1
             active_shocks = [sh for sh in active_shocks if sh["years_left"] > 0]
 
+        # advance state
         N = N_next.astype(dtype, copy=False)
-        maybe_store(t, N, A_att)
 
-    # <<< END OF LOOP — returns must be AFTER the loop >>>
+        # store snapshots
+        maybe_store(t, N, A_att, (M_cell if (mil_history is not None) else None))
+
+    # <<< END OF LOOP >>>
+    # expose last military state (even if not recording history)
+    military_trait = (M_cell.astype(np.float32) if military_enabled else None)
+
     if return_meta:
         meta = dict(
             biome=biome, water_mask=water_mask, D=D, land_scaled=land_scaled, h_raw=h_raw,
-            culture_anchor=(culture_anchor if culture_enabled else None)
+            culture_anchor=(culture_anchor if culture_enabled else None),
+            K_base=K_base,
+            military_trait=military_trait,  # last per-cell stance
         )
-        if record_attractiveness:
+        # return structure:
+        # - if record_attractiveness and record_military: ((pops, atts), mils), meta
+        # - if only one: (pops, that_one), meta
+        if record_attractiveness and (att_history is not None) and (mil_history is not None):
+            return ((pop_history, att_history), mil_history), meta
+        elif record_attractiveness and (att_history is not None):
             return (pop_history, att_history), meta
-        return pop_history, meta
+        elif mil_history is not None:
+            return (pop_history, mil_history), meta
+        else:
+            return pop_history, meta
 
-    if record_attractiveness:
+    if record_attractiveness and (att_history is not None):
         return (pop_history, att_history)
+    if mil_history is not None:
+        return (pop_history, mil_history)
     return pop_history
 
 # =========================================================
-# Visualizer (biome base + high-pop overlay + totals, population-only, attractiveness)
+# Visualizer (biome base + population/attractiveness/military + totals)
 # =========================================================
 def visualize_population_with_totals(
     pop_history,
     meta=None,
     # ---- view mode knob ----
-    view="biome_overlay",            # "biome_overlay" | "population" | "attractiveness"
+    view="biome_overlay",            # "biome_overlay" | "population" | "attractiveness" | "military"
+
     # ---- overlay knobs (biome_overlay) ----
+    overlay_metric="population",     # "population" or "military"
     highlight_frac=0.50,
     highlight_basis="start_max",     # "start_max" | "global_max" | "frame_max"
-    overlay_gamma=0.6,
-    overlay_cmap="magma",
+    # alpha controls (apply to both population & military overlays)
+    overlay_alpha_gamma=0.6,         # higher = more selective (sharper fade-in)
+    overlay_alpha_min=0.0,           # floor alpha
+    overlay_alpha_max=1.0,           # cap alpha
+    # colormaps
+    overlay_cmap="magma",            # for population overlay
+    overlay_military_cmap="coolwarm",
+    # military overlay options
+    overlay_cluster_threshold=2500.0,
+    overlay_use_culture=False,
+    overlay_military_color_window=(-0.5, 0.5),  # force color scale window (min,max)
+
     # ---- population-only knobs ----
     pop_cmap="magma",
     pop_log=False,
     pop_vmax=None,
     pop_vmax_mode="global",          # "global" | "frame"
+
     # ---- attractiveness view knobs ----
     att_history=None,                # REQUIRED when view="attractiveness"
     att_cmap="viridis",
     att_log=False,
     att_vmax=None,
-    att_vmax_mode="global",          # "global" | "frame"
+    att_vmax_mode="global",
+
+    # ---- military full-view knobs ----
+    military_cmap="coolwarm",
+    military_color_window=(-0.5, 0.5),
+    cluster_threshold=2500.0,
+    cluster_use_culture=False,
+
+    # ---- inputs from sim (preferred for military) ----
+    military_cell_history=None,      # list/array of [frames][H,W] in [-1,1]
+
+    # ---- COUNTRY BOUNDARIES (based on |stance|) ----
+    country_overlay=False,           # draw borders derived from military power
+    country_base_radius=2.0,         # base expansion in cells
+    country_scale=12.0,              # extra expansion per |stance|^gamma
+    country_gamma=1.0,               # nonlinearity on |stance|
+    country_min_stance=0.05,         # ignore near-neutral clusters
+    country_edge_alpha=0.95,
+    country_edge_color=None,         # None -> auto black/white for contrast
+
     # ---- animation & layout ----
     fps=12,
     title_prefix="Population — Year ",
@@ -602,7 +698,14 @@ def visualize_population_with_totals(
     show=True,
     first_year=0,
     step=1,
+    last_frame_png_path=None,
 ):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from scipy.ndimage import label, distance_transform_edt
+
     frames = len(pop_history)
     H, W = pop_history[0].shape
     totals = np.array([f.sum() for f in pop_history], dtype=np.float64)
@@ -620,11 +723,108 @@ def visualize_population_with_totals(
     def to_log(arr, flag):
         return np.log1p(arr) if flag else arr
 
+    # ---------- helpers ----------
+    def _stance_map(pop, military_cell, water_mask, thr, use_culture, culture_anchor=None):
+        # settlement mask
+        if use_culture and (culture_anchor is not None):
+            mask = (culture_anchor.astype(bool)) & (~water_mask)
+        else:
+            mask = (pop >= float(thr)) & (~water_mask)
+
+        lbl, nlab = label(mask.astype(np.int8), structure=np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=np.int8))
+        if nlab == 0:
+            out = np.zeros_like(pop, dtype=np.float32)
+            out[water_mask] = 0.0
+            return out, lbl, nlab, mask
+
+        lab_flat = lbl.ravel()
+        valid = lab_flat > 0
+        idx = lab_flat[valid].astype(np.int64)
+        pop_flat = pop.ravel()[valid].astype(np.float64)
+        m_flat   = military_cell.ravel()[valid].astype(np.float64)
+
+        sum_pop = np.bincount(idx, weights=pop_flat, minlength=nlab + 1)
+        sum_m   = np.bincount(idx, weights=pop_flat * m_flat, minlength=nlab + 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            means = sum_m[1:] / np.maximum(sum_pop[1:], 1e-12)
+        means = np.clip(means, -1.0, 1.0).astype(np.float32)
+
+        means_pad = np.zeros(nlab + 1, dtype=np.float32); means_pad[1:] = means
+        stance_map = means_pad[lbl]
+        stance_map[water_mask] = 0.0
+        return stance_map, lbl, nlab, mask
+
+    def _alpha_from_strength(strength):
+        strength = np.clip(strength, 0.0, 1.0)
+        return overlay_alpha_min + (overlay_alpha_max - overlay_alpha_min) * (strength ** overlay_alpha_gamma)
+
+    def _apply_color_window(values, window):
+        vmin, vmax = window
+        if vmax <= vmin: vmax = vmin + 1e-6
+        normed = (values - vmin) / (vmax - vmin)
+        return np.clip(normed, 0.0, 1.0)
+
+    def _military_cell(i):
+        if military_cell_history is not None:
+            return military_cell_history[i].astype(np.float32)
+        if (meta is not None) and ("military_trait" in meta) and (meta["military_trait"] is not None):
+            return meta["military_trait"].astype(np.float32)
+        return np.zeros_like(pop_history[0], dtype=np.float32)
+
+    def _country_labels(stance_map, lbl, nlab, mask, water_mask):
+        """
+        Expand each labeled settlement into a 'country' with radius depending on |stance|.
+        Returns: country_lbl (H,W) where 0=none, k>=1 is country id.
+        Clipped to land (~water_mask).
+        """
+        if nlab == 0:
+            return np.zeros_like(lbl, dtype=np.int32)
+
+        # per-label |stance| mean
+        lab_flat = lbl.ravel()
+        valid = lab_flat > 0
+        idx = lab_flat[valid].astype(np.int64)
+        s_flat = stance_map.ravel()[valid].astype(np.float64)
+        sum_abs = np.bincount(idx, weights=np.abs(s_flat), minlength=nlab + 1)
+        cnt     = np.bincount(idx, minlength=nlab + 1).astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean_abs = sum_abs[1:] / np.maximum(cnt[1:], 1e-12)
+        mean_abs = np.nan_to_num(mean_abs, nan=0.0).astype(np.float32)
+        mean_abs[mean_abs < float(country_min_stance)] = 0.0
+
+        # radii per label
+        radii = country_base_radius + country_scale * (mean_abs ** country_gamma)
+        radii = np.maximum(0.0, radii).astype(np.float32)
+
+        # distance to nearest settlement seed (mask)
+        inv = ~mask
+        dist, ind = distance_transform_edt(inv, return_indices=True)
+        ny, nx = ind[0], ind[1]
+        nearest_lbl = lbl[ny, nx]
+
+        # per-pixel radius of its nearest label
+        radii_pad = np.zeros(nlab + 1, dtype=np.float32)
+        radii_pad[1:] = radii
+        R = radii_pad[nearest_lbl]
+
+        # inside country if (nearest label exists) & (within radius) & (on land)
+        inside = (nearest_lbl > 0) & (dist <= R) & (~water_mask)
+        country_lbl = np.where(inside, nearest_lbl, 0).astype(np.int32)
+        return country_lbl
+
+
+    culture_anchor = meta.get("culture_anchor") if meta is not None else None
+    water_mask = meta.get("water_mask") if meta is not None else np.zeros_like(pop_history[0], dtype=bool)
+
+    # =========================
+    # VIEW ROUTING
+    # =========================
     if view == "biome_overlay":
         if meta is None or "biome" not in meta:
             raise ValueError("meta with 'biome' is required for biome-colored base when view='biome_overlay'.")
         biome = meta["biome"].astype(np.int16)
 
+        # base biome tiles
         biome_colors = np.array([
             [ 54,  90, 154],  # water
             [237, 201, 175],  # sand
@@ -635,43 +835,117 @@ def visualize_population_with_totals(
         ], dtype=np.float32) / 255.0
         biome_cmap = ListedColormap(biome_colors)
         biome_norm = BoundaryNorm(boundaries=[-0.5,0.5,1.5,2.5,3.5,4.5,5.5], ncolors=biome_cmap.N)
-        ax_top.imshow(biome, cmap=biome_cmap, norm=biome_norm, origin="upper")
+        base_img = ax_top.imshow(biome, cmap=biome_cmap, norm=biome_norm, origin="upper")
 
-        if highlight_basis not in {"start_max", "global_max", "frame_max"}:
-            raise ValueError("highlight_basis must be one of: 'start_max','global_max','frame_max'.")
+        if overlay_metric not in {"population", "military"}:
+            raise ValueError("overlay_metric must be 'population' or 'military'.")
 
-        def make_overlay(pop, thr, top):
-            rng = max(1e-9, (top - thr))
-            strength = np.clip((pop - thr) / rng, 0.0, 1.0)
-            alpha = strength ** overlay_gamma
-            cmap = plt.get_cmap(overlay_cmap)
-            rgba = cmap(np.clip(pop / max(1e-9, top), 0, 1))
-            rgba[..., 3] = alpha
-            return rgba
+        # Precompute global basis if needed
+        if overlay_metric == "population":
+            basis_global = float(max(np.max(f) for f in pop_history)) if highlight_basis == "global_max" else None
+        else:
+            def _stance_abs_max(i):
+                pop = pop_history[i].astype(np.float32)
+                mcell = _military_cell(i)
+                stance, lbl, nlab, mask = _stance_map(pop, mcell, water_mask,
+                                                      overlay_cluster_threshold, overlay_use_culture, culture_anchor)
+                return float(np.max(np.abs(stance)))
+            basis_global = None
+            if highlight_basis == "global_max":
+                basis_global = 0.0
+                for i in range(frames):
+                    basis_global = max(basis_global, _stance_abs_max(i))
 
-        pop0   = pop_history[0].astype(np.float32)
-        basis0 = {"start_max": start_max, "global_max": global_max, "frame_max": float(pop0.max())}[highlight_basis]
-        thr0   = highlight_frac * (basis0 if basis0 > 0 else 1.0)
-        top0   = basis0 if highlight_basis in ("start_max", "global_max") else float(pop0.max())
-        im_top = ax_top.imshow(make_overlay(pop0, thr0, top0), origin="upper")
+        def make_overlay(i):
+            pop = pop_history[i].astype(np.float32)
+            if overlay_metric == "population":
+                basis = {
+                    "start_max": float(np.max(pop_history[0])),
+                    "global_max": (basis_global if basis_global is not None else float(np.max(pop))),
+                    "frame_max": float(np.max(pop)),
+                }[highlight_basis]
+                thr = highlight_frac * (basis if basis > 0 else 1.0)
+                rngv = max(1e-9, (basis - thr))
+                strength = np.clip((pop - thr) / rngv, 0.0, 1.0)  # [0,1]
+                alpha = _alpha_from_strength(strength)
+                cmap = plt.get_cmap(overlay_cmap)
+                rgba = cmap(np.clip(pop / max(1e-9, basis), 0, 1))
+
+                # borders off in population overlay
+                rgba[..., 3] = alpha
+                return rgba
+            else:
+                mcell = _military_cell(i)
+                stance, lbl, nlab, mask = _stance_map(pop, mcell, water_mask,
+                                                      overlay_cluster_threshold, overlay_use_culture, culture_anchor)
+
+                # basis for alpha (abs stance)
+                if highlight_basis == "start_max":
+                    pop0 = pop_history[0].astype(np.float32)
+                    m0 = _military_cell(0)
+                    st0, _, _, _ = _stance_map(pop0, m0, water_mask,
+                                               overlay_cluster_threshold, overlay_use_culture, culture_anchor)
+                    basis = float(np.max(np.abs(st0)))
+                elif highlight_basis == "global_max":
+                    basis = basis_global if basis_global is not None else float(np.max(np.abs(stance)))
+                else:
+                    basis = float(np.max(np.abs(stance)))
+                basis = basis if basis > 0 else 1.0
+
+                thr = highlight_frac * basis
+                rngv = max(1e-9, (basis - thr))
+                strength = np.clip((np.abs(stance) - thr) / rngv, 0.0, 1.0)
+                alpha = _alpha_from_strength(strength)
+
+                cmap = plt.get_cmap(overlay_military_cmap)
+                normed = _apply_color_window(stance, overlay_military_color_window)
+                rgba = cmap(normed)
+                rgba[..., 3] = alpha
+
+                # ---- Country borders (optional) ----
+                # ---- Country borders (optional) ----
+                if country_overlay:
+                    country_lbl = _country_labels(stance, lbl, nlab, mask, water_mask)
+                    L = country_lbl
+                    land = ~water_mask
+                    nz = (L > 0) & land
+
+                    # borders between different countries OR next to water
+                    neighbor_diff = (
+                        (L != np.roll(L, 1, axis=0)) |
+                        (L != np.roll(L,-1, axis=0)) |
+                        (L != np.roll(L, 1, axis=1)) |
+                        (L != np.roll(L,-1, axis=1))
+                    )
+                    coast_touch = (
+                        np.roll(water_mask, 1, axis=0) |
+                        np.roll(water_mask,-1, axis=0) |
+                        np.roll(water_mask, 1, axis=1) |
+                        np.roll(water_mask,-1, axis=1)
+                    )
+                    edge = nz & (neighbor_diff | coast_touch)
+
+                    # paint edges solid black
+                    rgba[edge, :3] = 0.0
+                    rgba[edge,  3] = country_edge_alpha
+
+
+                return rgba
+
+        im_top = ax_top.imshow(make_overlay(0), origin="upper")
 
         def update_top(i):
-            pop = pop_history[i].astype(np.float32)
-            basis = {"start_max": start_max, "global_max": global_max, "frame_max": float(pop.max())}[highlight_basis]
-            thr = highlight_frac * (basis if basis > 0 else 1.0)
-            top = basis if highlight_basis in ("start_max", "global_max") else float(pop.max())
-            im_top.set_data(make_overlay(pop, thr, top))
+            im_top.set_data(make_overlay(i))
             return (im_top,)
 
         update_top(0)
 
     elif view == "population":
         pop0 = to_log(pop_history[0].astype(np.float32), pop_log)
-        if pop_vmax is not None:
-            vmax0 = pop_vmax
-        else:
-            vmax0 = float(max(np.max(to_log(f.astype(np.float32), pop_log)) for f in pop_history)) \
-                    if pop_vmax_mode == "global" else float(pop0.max())
+        vmax0 = pop_vmax if pop_vmax is not None else (
+            float(max(np.max(to_log(f.astype(np.float32), pop_log)) for f in pop_history))
+            if pop_vmax_mode == "global" else float(pop0.max())
+        )
         im_top = ax_top.imshow(pop0, cmap=pop_cmap, vmin=0.0, vmax=max(1e-9, vmax0), origin="upper")
         cb = plt.colorbar(im_top, ax=ax_top, fraction=0.046, pad=0.02)
         cb.set_label("log1p(population)" if pop_log else "population per cell")
@@ -687,13 +961,12 @@ def visualize_population_with_totals(
 
     elif view == "attractiveness":
         if att_history is None:
-            raise ValueError("att_history is required when view='attractiveness'. Enable `record_attractiveness=True` in the simulator and pass the returned list here.")
+            raise ValueError("att_history is required when view='attractiveness'.")
         att0 = to_log(att_history[0].astype(np.float32), att_log)
-        if att_vmax is not None:
-            vmax0 = att_vmax
-        else:
-            vmax0 = float(max(np.max(to_log(a.astype(np.float32), att_log)) for a in att_history)) \
-                    if att_vmax_mode == "global" else float(att0.max())
+        vmax0 = att_vmax if att_vmax is not None else (
+            float(max(np.max(to_log(a.astype(np.float32), att_log)) for a in att_history))
+            if att_vmax_mode == "global" else float(att0.max())
+        )
         im_top = ax_top.imshow(att0, cmap=att_cmap, vmin=0.0, vmax=max(1e-9, vmax0), origin="upper")
         cb = plt.colorbar(im_top, ax=ax_top, fraction=0.046, pad=0.02)
         cb.set_label("log1p(attractiveness)" if att_log else "attractiveness")
@@ -707,9 +980,72 @@ def visualize_population_with_totals(
 
         update_top(0)
 
-    else:
-        raise ValueError("view must be 'biome_overlay' or 'population' or 'attractiveness'.")
+    elif view == "military":
+        if meta is None or water_mask is None:
+            raise ValueError("meta with 'water_mask' is required for military view.")
 
+        def stance_frame(i):
+            pop = pop_history[i].astype(np.float32)
+            mcell = _military_cell(i)
+            st, lbl, nlab, mask = _stance_map(pop, mcell, water_mask,
+                                              cluster_threshold, cluster_use_culture, culture_anchor)
+            if country_overlay:
+                country_lbl = _country_labels(st, lbl, nlab, mask)
+                return st, country_lbl
+            return st, None
+
+        st0, c0 = stance_frame(0)
+        normed0 = _apply_color_window(st0, military_color_window)
+        im_top = ax_top.imshow(normed0, cmap=military_cmap, vmin=0.0, vmax=1.0, origin="upper")
+        cb = plt.colorbar(im_top, ax=ax_top, fraction=0.046, pad=0.02)
+        cb.set_label(f"military stance mapped via window {military_color_window}")
+
+        # add a second image for borders if needed
+        if country_overlay:
+            border_img = ax_top.imshow(np.zeros((H, W, 4), dtype=np.float32), origin="upper")
+
+        def _edge_rgba(country_lbl):
+            if country_lbl is None:
+                return None
+            L = country_lbl
+            nz = L > 0
+            edge = nz & (
+                (L != np.roll(L, 1, axis=0)) |
+                (L != np.roll(L,-1, axis=0)) |
+                (L != np.roll(L, 1, axis=1)) |
+                (L != np.roll(L,-1, axis=1))
+            )
+            rgba = np.zeros((H, W, 4), dtype=np.float32)
+            if country_edge_color is None:
+                base = im_top.get_array()
+                # approximate brightness from current colormap output (already 0..1)
+                # If it’s a scalar image, map through the cmap; here we pick black/white default:
+                edge_rgb = np.zeros((H, W, 3), dtype=np.float32)
+            else:
+                from matplotlib.colors import to_rgb
+                c = np.array(to_rgb(country_edge_color), dtype=np.float32)
+                edge_rgb = np.broadcast_to(c, (H, W, 3)).copy()
+            rgba[edge, :3] = edge_rgb[edge]
+            rgba[edge, 3]  = country_edge_alpha
+            return rgba
+
+        if country_overlay and c0 is not None:
+            border_img.set_data(_edge_rgba(c0))
+
+        def update_top(i):
+            st, cL = stance_frame(i)
+            im_top.set_data(_apply_color_window(st, military_color_window))
+            if country_overlay and cL is not None:
+                border_img.set_data(_edge_rgba(cL))
+                return (im_top, border_img)
+            return (im_top,)
+
+        update_top(0)
+
+    else:
+        raise ValueError("view must be 'biome_overlay' or 'population' or 'attractiveness' or 'military'.")
+
+    # timeline
     x = np.arange(frames) * step + first_year
     (line,) = ax_bot.plot(x[:1], totals[:1])
     ax_bot.set_xlim(x[0], x[-1])
@@ -725,6 +1061,11 @@ def visualize_population_with_totals(
         return (*artists, ttl, line, vline)
 
     anim = FuncAnimation(fig, update, frames=frames, interval=1000/max(1, fps), blit=False)
+
+    if last_frame_png_path is not None:
+        update(frames - 1)
+        fig.canvas.draw_idle()
+        fig.savefig(last_frame_png_path, dpi=220, bbox_inches="tight")
 
     if show:
         plt.show()
@@ -745,7 +1086,8 @@ if __name__ == "__main__":
     xs, ys = np.meshgrid(np.arange(W), np.arange(H))
     heightmap_xyz = np.column_stack([xs.ravel(), ys.ravel(), z.ravel()])
 
-    (pops, atts), meta = simulate_population_from_heightmap(
+    # --- run sim; record both attractiveness and military histories
+    ((pops, atts), mils), meta = simulate_population_from_heightmap(
         heightmap_xyz,
         sea_level=0.0,
         years=800, seed=11,
@@ -768,23 +1110,69 @@ if __name__ == "__main__":
         culture_min_abs=900.0, culture_min_frac=0.06,
         # Sand corridor & stronger water pull
         alpha_w=1.6, water_affinity_gain=0.35, sand_corridor_boost=0.6,
-        # Exodus (new)
-        exodus_enabled=True,
-        exodus_prob=0.07,
-        exodus_events_mean=1.2,
-        exodus_group_frac=0.22,
-        exodus_min_dist=50,
-        exodus_max_dist=None,
-        exodus_target_bias_water=0.0,
-        exodus_target_bias_empty=0.8,
-        exodus_culture_factor=0.5,
+        # Exodus
+        exodus_enabled=True, exodus_prob=0.07, exodus_events_mean=1.2,
+        exodus_group_frac=0.22, exodus_min_dist=50,
+        exodus_max_dist=None, exodus_target_bias_water=0.0,
+        exodus_target_bias_empty=0.8, exodus_culture_factor=0.5,
+        # Military forcing in the sim
+        military_enabled=True,
+        record_military=True,              # <-- store per-frame military arrays
+        military_forcing_enabled=True,     # <-- run periodic anti-neutral push
+        military_neutral_band=0.10,
+        military_period=24,
+        military_strength=0.6,
+        military_shape="sin",
         # recording & performance
         save_every=1, dtype=np.float32, return_meta=True, record_attractiveness=True
     )
     print("Frames:", len(pops), "Grid:", pops[0].shape, "Start:", int(pops[0].sum()), "End:", int(pops[-1].sum()))
 
-    # Try different views:
-    visualize_population_with_totals(pops, meta, view="biome_overlay", highlight_frac=0.1, fps=12)
-    # visualize_population_with_totals(pops, meta, view="population", pop_log=True, pop_vmax_mode="frame", fps=12)
-    # visualize_population_with_totals(pops, meta, view="attractiveness", att_history=atts, att_cmap="viridis", att_log=False, att_vmax_mode="global", fps=12, first_year=0, step=1)
-    
+    # 1) Biome + population overlay with last-frame png
+    visualize_population_with_totals(
+        pops, meta,
+        view="biome_overlay",
+        overlay_metric="population",
+        highlight_frac=0.1,
+        fps=12,
+        last_frame_png_path="population_last.png"
+    )
+
+    # 2) Biome + military overlay (alpha by |stance| vs threshold; colors via window)
+    visualize_population_with_totals(
+        pops, meta,
+        view="biome_overlay",
+        overlay_metric="military",
+        overlay_military_color_window=(-0.5, 0.5),
+        overlay_alpha_gamma=1.1,
+        overlay_alpha_min=0.6,
+        overlay_alpha_max=1,
+        overlay_cluster_threshold=2600.0,
+        military_cell_history=mils,     # from the sim
+        # countries:
+        country_overlay=True,
+        country_base_radius=2.0,
+        country_scale=14.0,
+        country_gamma=1.2,
+        country_min_stance=0.08,
+        country_edge_alpha=0.95,
+        # country_edge_color="black",   # optional override
+        title_prefix="Military + Countries — Year ",
+        fps=12,
+    )
+
+
+    # 3) Full military view (time-evolving)
+    visualize_population_with_totals(
+        pop_history=pops,
+        meta=meta,
+        view="military",
+        military_cell_history=mils,         # <-- from sim
+        military_cmap="coolwarm",
+        military_color_window=(-0.5, 0.5),
+        cluster_threshold=2600.0,
+        cluster_use_culture=False,
+        fps=12,
+        title_prefix="Military — Year ",
+        last_frame_png_path="military_last.png"
+    )
