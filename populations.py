@@ -129,7 +129,7 @@ def heightmap_xyz_to_grid(heightmap_xyz, H=None, W=None, dtype=np.float32):
     return h_raw
 
 # =========================================================
-# Full simulation — fast & feature-complete (+ Exodus + Military)
+# Full simulation — fast & feature-complete (+ Exodus + Military + Countries/Capitals)
 # =========================================================
 def simulate_population_from_heightmap(
     heightmap_xyz,
@@ -194,6 +194,16 @@ def simulate_population_from_heightmap(
     military_shape="sin",                   # "sin" | "saw" | "linear"
     # ---------------------------------------------------
 
+    # ------------------ COUNTRIES & CAPITALS (computed inside sim) ------------------
+    record_countries=False,            # store per-frame country labels and capitals
+    overlay_cluster_threshold=2500.0,  # settlements >= threshold become seeds
+    overlay_use_culture=False,         # use culture anchors instead of pop threshold
+    country_base_radius=2.0,           # growth radius base
+    country_scale=12.0,                # growth per |stance|
+    country_gamma=1.0,                 # nonlinearity for |stance|
+    country_min_stance=0.05,           # ignore near-neutral clusters
+    # ---------------------------------------------------
+
     # run control
     years=300, seed=42, clip_negative=True, dtype=np.float32,
     save_every=1, return_meta=False, record_attractiveness=False,
@@ -202,6 +212,96 @@ def simulate_population_from_heightmap(
     Feature-complete, vectorized population simulation (heightmap-in).
     """
     rng = np.random.default_rng(seed)
+
+    # ----- local helpers for countries/capitals (sim-owned) -----
+    def _stance_map_local(pop, military_cell, water_mask, thr, use_culture, culture_anchor=None):
+        """Return (stance_map[-1..1], lbl, nlab, mask) with pop-weighted cluster means."""
+        if use_culture and (culture_anchor is not None):
+            mask = (culture_anchor.astype(bool)) & (~water_mask)
+        else:
+            mask = (pop >= float(thr)) & (~water_mask)
+
+        lbl_, nlab_ = label(mask.astype(np.int8),
+                            structure=np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=np.int8))
+        if nlab_ == 0:
+            out = np.zeros_like(pop, dtype=np.float32)
+            out[water_mask] = 0.0
+            return out, lbl_, nlab_, mask
+
+        lab_flat = lbl_.ravel(); valid = lab_flat > 0; idx = lab_flat[valid].astype(np.int64)
+        pop_flat = pop.ravel()[valid].astype(np.float64)
+        m_flat   = military_cell.ravel()[valid].astype(np.float64)
+
+        sum_pop = np.bincount(idx, weights=pop_flat, minlength=nlab_ + 1)
+        sum_m   = np.bincount(idx, weights=pop_flat * m_flat, minlength=nlab_ + 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            means = sum_m[1:] / np.maximum(sum_pop[1:], 1e-12)
+        means = np.clip(means, -1.0, 1.0).astype(np.float32)
+
+        means_pad = np.zeros(nlab_ + 1, dtype=np.float32); means_pad[1:] = means
+        stance_map = means_pad[lbl_]
+        stance_map[water_mask] = 0.0
+        return stance_map, lbl_, nlab_, mask
+
+    def _country_labels_clip_land_local(stance_map, lbl_, nlab_, mask, water_mask,
+                                        base_radius, scale, gamma, min_stance):
+        """Grow each settlement into a 'country' over LAND only, radius ~ |stance|."""
+        if nlab_ == 0:
+            return np.zeros_like(lbl_, dtype=np.int32)
+
+        lab_flat = lbl_.ravel(); valid = lab_flat > 0; idx = lab_flat[valid].astype(np.int64)
+        s_flat = stance_map.ravel()[valid].astype(np.float64)
+
+        sum_abs = np.bincount(idx, weights=np.abs(s_flat), minlength=nlab_ + 1)
+        cnt     = np.bincount(idx, minlength=nlab_ + 1).astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean_abs = sum_abs[1:] / np.maximum(cnt[1:], 1e-12)
+        mean_abs = np.nan_to_num(mean_abs, nan=0.0).astype(np.float32)
+        mean_abs[mean_abs < float(min_stance)] = 0.0
+
+        radii = country_base_radius + country_scale * (mean_abs ** country_gamma)
+        radii = np.maximum(0.0, radii).astype(np.float32)
+
+        inv = ~mask
+        dist, ind = distance_transform_edt(inv, return_indices=True)
+        ny, nx = ind[0], ind[1]
+        nearest_lbl = lbl_[ny, nx]
+
+        radii_pad = np.zeros(nlab_ + 1, dtype=np.float32); radii_pad[1:] = radii
+        R = radii_pad[nearest_lbl]
+
+        inside = (nearest_lbl > 0) & (dist <= R) & (~water_mask)
+        return np.where(inside, nearest_lbl, 0).astype(np.int32)
+
+    def _country_capitals_local(pop, country_lbl):
+        """
+        Population-weighted center of mass per country label.
+        Returns cy, cx, labels (1D float32/float32/int32).
+        """
+        Hh, Ww = pop.shape
+        L = country_lbl
+        labels = np.unique(L[L > 0])
+        if labels.size == 0:
+            return (np.empty(0, np.float32), np.empty(0, np.float32), np.empty(0, np.int32))
+
+        yy_, xx_ = np.indices((Hh, Ww))
+        Lf = L.ravel()
+        Pf = pop.ravel().astype(np.float64)
+        yf = yy_.ravel().astype(np.float64)
+        xf = xx_.ravel().astype(np.float64)
+
+        max_lab = int(labels.max())
+        sumP   = np.bincount(Lf, weights=Pf, minlength=max_lab+1)
+        sumPy  = np.bincount(Lf, weights=Pf * yf, minlength=max_lab+1)
+        sumPx  = np.bincount(Lf, weights=Pf * xf, minlength=max_lab+1)
+
+        valid = labels[sumP[labels] > 0]
+        if valid.size == 0:
+            return (np.empty(0, np.float32), np.empty(0, np.float32), np.empty(0, np.int32))
+
+        cy = (sumPy[valid] / sumP[valid]).astype(np.float32)
+        cx = (sumPx[valid] / sumP[valid]).astype(np.float32)
+        return cy, cx, valid.astype(np.int32)
 
     # -------- Terrain from heightmap --------
     h_raw = heightmap_xyz_to_grid(heightmap_xyz, H=H, W=W, dtype=dtype)
@@ -275,6 +375,8 @@ def simulate_population_from_heightmap(
     pop_history = []
     att_history = [] if record_attractiveness else None
     mil_history = [] if (military_enabled and record_military) else None
+    countries_history = [] if record_countries else None
+    capitals_history  = [] if record_countries else None  # list of dicts {"cy","cx","label"}
 
     def maybe_store(t, arr_pop, arr_att=None, arr_mil=None):
         if t % save_every == 0:
@@ -595,6 +697,35 @@ def simulate_population_from_heightmap(
             M_cell = np.clip(M_cell + (sgn.astype(np.float32) * delta), -1.0, 1.0)
             M_cell[water_mask] = 0.0
 
+        # ----- Countries & Capitals (optional recording) -----
+        if record_countries:
+            # Basis: next population field (post-flows)
+            P_for_labels = N_next.astype(np.float32)
+            M_for_labels = (M_cell.astype(np.float32) if military_enabled else np.zeros_like(P_for_labels, dtype=np.float32))
+
+            stance_map, lbl_, nlab_, mask_ = _stance_map_local(
+                pop=P_for_labels,
+                military_cell=M_for_labels,
+                water_mask=water_mask,
+                thr=overlay_cluster_threshold,
+                use_culture=overlay_use_culture,
+                culture_anchor=(culture_anchor if culture_enabled else None)
+            )
+
+            c_lbl = _country_labels_clip_land_local(
+                stance_map, lbl_, nlab_, mask_, water_mask,
+                base_radius=country_base_radius,
+                scale=country_scale,
+                gamma=country_gamma,
+                min_stance=country_min_stance
+            )
+            cy, cx, lab_ids = _country_capitals_local(P_for_labels, c_lbl)
+
+            countries_history.append(c_lbl.astype(np.int32))
+            capitals_history.append({
+                "cy": cy, "cx": cx, "label": lab_ids
+            })
+
         # Expire shocks
         if active_shocks:
             for sh in active_shocks: sh["years_left"] -= 1
@@ -611,11 +742,19 @@ def simulate_population_from_heightmap(
     military_trait = (M_cell.astype(np.float32) if military_enabled else None)
 
     if return_meta:
+        countries_last = (countries_history[-1] if (record_countries and countries_history) else None)
+        capitals_last  = (capitals_history[-1]  if (record_countries and capitals_history)  else None)
+
         meta = dict(
             biome=biome, water_mask=water_mask, D=D, land_scaled=land_scaled, h_raw=h_raw,
             culture_anchor=(culture_anchor if culture_enabled else None),
             K_base=K_base,
             military_trait=military_trait,  # last per-cell stance
+            # NEW simulator-owned country artifacts:
+            countries_history=(countries_history if record_countries else None),
+            capitals_history=(capitals_history  if record_countries else None),
+            countries_last=countries_last,
+            capitals_last=capitals_last,
         )
         # return structure:
         # - if record_attractiveness and record_military: ((pops, atts), mils), meta
@@ -902,8 +1041,7 @@ def visualize_population_with_totals(
                 rgba = cmap(normed)
                 rgba[..., 3] = alpha
 
-                # ---- Country borders (optional) ----
-                # ---- Country borders (optional) ----
+                # Country borders (optional) — derived from stance (viz-only)
                 if country_overlay:
                     country_lbl = _country_labels(stance, lbl, nlab, mask, water_mask)
                     L = country_lbl
@@ -928,7 +1066,6 @@ def visualize_population_with_totals(
                     # paint edges solid black
                     rgba[edge, :3] = 0.0
                     rgba[edge,  3] = country_edge_alpha
-
 
                 return rgba
 
@@ -990,7 +1127,7 @@ def visualize_population_with_totals(
             st, lbl, nlab, mask = _stance_map(pop, mcell, water_mask,
                                               cluster_threshold, cluster_use_culture, culture_anchor)
             if country_overlay:
-                country_lbl = _country_labels(st, lbl, nlab, mask)
+                country_lbl = _country_labels(st, lbl, nlab, mask, water_mask)
                 return st, country_lbl
             return st, None
 
@@ -1017,9 +1154,6 @@ def visualize_population_with_totals(
             )
             rgba = np.zeros((H, W, 4), dtype=np.float32)
             if country_edge_color is None:
-                base = im_top.get_array()
-                # approximate brightness from current colormap output (already 0..1)
-                # If it’s a scalar image, map through the cmap; here we pick black/white default:
                 edge_rgb = np.zeros((H, W, 3), dtype=np.float32)
             else:
                 from matplotlib.colors import to_rgb
@@ -1075,8 +1209,503 @@ def visualize_population_with_totals(
     plt.close(fig)
     return anim
 
+
+# PLOTLY VIZ
+# ---------- Country helpers for Plotly viz ----------
+from scipy.ndimage import label, distance_transform_edt
+
+def _stance_map(pop, military_cell, water_mask, thr, use_culture, culture_anchor=None):
+    """Settlement labels + stance means (same as your Matplotlib viz logic)."""
+    if use_culture and (culture_anchor is not None):
+        mask = (culture_anchor.astype(bool)) & (~water_mask)
+    else:
+        mask = (pop >= float(thr)) & (~water_mask)
+
+    lbl, nlab = label(mask.astype(np.int8),
+                      structure=np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=np.int8))
+    if nlab == 0:
+        out = np.zeros_like(pop, dtype=np.float32)
+        out[water_mask] = 0.0
+        return out, lbl, nlab, mask
+
+    lab_flat = lbl.ravel()
+    valid = lab_flat > 0
+    idx = lab_flat[valid].astype(np.int64)
+    pop_flat = pop.ravel()[valid].astype(np.float64)
+    m_flat   = military_cell.ravel()[valid].astype(np.float64)
+
+    sum_pop = np.bincount(idx, weights=pop_flat, minlength=nlab + 1)
+    sum_m   = np.bincount(idx, weights=pop_flat * m_flat, minlength=nlab + 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        means = sum_m[1:] / np.maximum(sum_pop[1:], 1e-12)
+    means = np.clip(means, -1.0, 1.0).astype(np.float32)
+
+    means_pad = np.zeros(nlab + 1, dtype=np.float32); means_pad[1:] = means
+    stance_map = means_pad[lbl]
+    stance_map[water_mask] = 0.0
+    return stance_map, lbl, nlab, mask
+
+def _country_labels_clip_land(stance_map, lbl, nlab, mask, water_mask,
+                              country_base_radius=2.0, country_scale=12.0,
+                              country_gamma=1.0, country_min_stance=0.05):
+    """Expand each labeled settlement into a 'country' over LAND only, based on |stance|."""
+    if nlab == 0:
+        return np.zeros_like(lbl, dtype=np.int32)
+
+    lab_flat = lbl.ravel()
+    valid = lab_flat > 0
+    idx = lab_flat[valid].astype(np.int64)
+    s_flat = stance_map.ravel()[valid].astype(np.float64)
+
+    sum_abs = np.bincount(idx, weights=np.abs(s_flat), minlength=nlab + 1)
+    cnt     = np.bincount(idx, minlength=nlab + 1).astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean_abs = sum_abs[1:] / np.maximum(cnt[1:], 1e-12)
+    mean_abs = np.nan_to_num(mean_abs, nan=0.0).astype(np.float32)
+    mean_abs[mean_abs < float(country_min_stance)] = 0.0
+
+    radii = country_base_radius + country_scale * (mean_abs ** country_gamma)
+    radii = np.maximum(0.0, radii).astype(np.float32)
+
+    inv = ~mask
+    dist, ind = distance_transform_edt(inv, return_indices=True)
+    ny, nx = ind[0], ind[1]
+    nearest_lbl = lbl[ny, nx]
+
+    radii_pad = np.zeros(nlab + 1, dtype=np.float32); radii_pad[1:] = radii
+    R = radii_pad[nearest_lbl]
+
+    inside = (nearest_lbl > 0) & (dist <= R) & (~water_mask)
+    country_lbl = np.where(inside, nearest_lbl, 0).astype(np.int32)
+    return country_lbl
+
+def _country_edges_black(country_lbl, water_mask):
+    """Boolean edge mask: country vs country OR country vs coast. Always on land side."""
+    L = country_lbl
+    land = ~water_mask
+    nz = (L > 0) & land
+    neighbor_diff = (
+        (L != np.roll(L, 1, axis=0)) |
+        (L != np.roll(L,-1, axis=0)) |
+        (L != np.roll(L, 1, axis=1)) |
+        (L != np.roll(L,-1, axis=1))
+    )
+    coast_touch = (
+        np.roll(water_mask, 1, axis=0) |
+        np.roll(water_mask,-1, axis=0) |
+        np.roll(water_mask, 1, axis=1) |
+        np.roll(water_mask,-1, axis=1)
+    )
+    edge = nz & (neighbor_diff | coast_touch)
+    return edge
+
+def _country_capitals(pop, country_lbl):
+    """
+    Population-weighted center of mass (capital) per country label.
+    Returns arrays: cap_y, cap_x, cap_label (all 1D, one per country present this frame).
+    """
+    H, W = pop.shape
+    L = country_lbl
+    labels = np.unique(L[L > 0])
+    if labels.size == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    # indices grid
+    yy, xx = np.indices((H, W))
+    # flatten
+    Lf = L.ravel()
+    Pf = pop.ravel().astype(np.float64)
+    yf = yy.ravel().astype(np.float64)
+    xf = xx.ravel().astype(np.float64)
+
+    max_lab = int(labels.max())
+    # sums per label
+    sumP   = np.bincount(Lf, weights=Pf, minlength=max_lab+1)
+    sumPy  = np.bincount(Lf, weights=Pf * yf, minlength=max_lab+1)
+    sumPx  = np.bincount(Lf, weights=Pf * xf, minlength=max_lab+1)
+
+    valid = (labels[sumP[labels] > 0])
+    if valid.size == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    cy = (sumPy[valid] / sumP[valid])
+    cx = (sumPx[valid] / sumP[valid])
+    return cy.astype(np.float32), cx.astype(np.float32), valid.astype(np.int32)
+
+def visualize_plotly_countries(
+    pop_history,
+    meta,
+    att_history=None,
+    military_cell_history=None,
+    # threshold fractions (relative to each layer’s basis)
+    pop_highlight_frac=0.10,
+    att_highlight_frac=0.10,
+    mil_highlight_frac=0.10,            # uses ABS(stance) > frac * max_abs
+    overlay_cluster_threshold=2500.0,   # settlement threshold for forming clusters
+    overlay_use_culture=False,          # if True, use culture anchors instead of population threshold
+    overlay_military_color_window=(-0.5, 0.5),  # force color window for military
+    # country params
+    country_overlay=True,
+    country_base_radius=2.0,
+    country_scale=12.0,
+    country_gamma=1.0,
+    country_min_stance=0.05,
+    country_edge_alpha=0.95,
+    # initial visibility
+    show_population=True,
+    show_attractiveness=False,
+    show_military=True,
+    show_borders=True,
+    show_capitals=True,
+    # style
+    title="Biomes + Overlays (Plotly)",
+    height=700,
+):
+    """
+    Plotly visualizer: biomes base + masked overlays (Population/Attractiveness/Military),
+    black land-clipped country borders, big red capital circles, year slider + per-overlay toggles.
+    Export with: fig.write_html("map.html", include_plotlyjs="cdn", full_html=True)
+    """
+    import numpy as np
+    import plotly.graph_objects as go
+    from scipy.ndimage import label, distance_transform_edt
+
+    # ---------------- helpers ----------------
+    def _stance_map_local(pop, military_cell, water_mask, thr, use_culture, culture_anchor=None):
+        """Return (stance_map[-1..1], lbl, nlab, mask) with pop-weighted cluster means."""
+        if use_culture and (culture_anchor is not None):
+            mask = (culture_anchor.astype(bool)) & (~water_mask)
+        else:
+            mask = (pop >= float(thr)) & (~water_mask)
+
+        lbl_, nlab_ = label(mask.astype(np.int8),
+                            structure=np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=np.int8))
+        if nlab_ == 0:
+            out = np.zeros_like(pop, dtype=np.float32)
+            out[water_mask] = 0.0
+            return out, lbl_, nlab_, mask
+
+        lab_flat = lbl_.ravel(); valid = lab_flat > 0; idx = lab_flat[valid].astype(np.int64)
+        pop_flat = pop.ravel()[valid].astype(np.float64)
+        m_flat   = military_cell.ravel()[valid].astype(np.float64)
+
+        sum_pop = np.bincount(idx, weights=pop_flat, minlength=nlab_ + 1)
+        sum_m   = np.bincount(idx, weights=pop_flat * m_flat, minlength=nlab_ + 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            means = sum_m[1:] / np.maximum(sum_pop[1:], 1e-12)
+        means = np.clip(means, -1.0, 1.0).astype(np.float32)
+
+        means_pad = np.zeros(nlab_ + 1, dtype=np.float32); means_pad[1:] = means
+        stance_map = means_pad[lbl_]
+        stance_map[water_mask] = 0.0
+        return stance_map, lbl_, nlab_, mask
+
+    def _country_labels_clip_land_local(stance_map, lbl_, nlab_, mask, water_mask,
+                                  base_radius, scale, gamma, min_stance):
+        """Grow each settlement into a 'country' over LAND only, radius ~ |stance|."""
+        if nlab_ == 0: return np.zeros_like(lbl_, dtype=np.int32)
+        lab_flat = lbl_.ravel(); valid = lab_flat > 0; idx = lab_flat[valid].astype(np.int64)
+        s_flat = stance_map.ravel()[valid].astype(np.float64)
+
+        sum_abs = np.bincount(idx, weights=np.abs(s_flat), minlength=nlab_ + 1)
+        cnt     = np.bincount(idx, minlength=nlab_ + 1).astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean_abs = sum_abs[1:] / np.maximum(cnt[1:], 1e-12)
+        mean_abs = np.nan_to_num(mean_abs, nan=0.0).astype(np.float32)
+        mean_abs[mean_abs < float(min_stance)] = 0.0
+
+        radii = base_radius + scale * (mean_abs ** gamma)
+        radii = np.maximum(0.0, radii).astype(np.float32)
+
+        inv = ~mask
+        dist, ind = distance_transform_edt(inv, return_indices=True)
+        ny, nx = ind[0], ind[1]
+        nearest_lbl = lbl_[ny, nx]
+
+        radii_pad = np.zeros(nlab_ + 1, dtype=np.float32); radii_pad[1:] = radii
+        R = radii_pad[nearest_lbl]
+
+        inside = (nearest_lbl > 0) & (dist <= R) & (~water_mask)
+        return np.where(inside, nearest_lbl, 0).astype(np.int32)
+
+    def _country_edges_black_local(country_lbl, water_mask):
+        """Edge mask at country boundaries and along coast (land side only)."""
+        L = country_lbl; land = ~water_mask; nz = (L > 0) & land
+        neighbor_diff = (
+            (L != np.roll(L, 1, axis=0)) |
+            (L != np.roll(L,-1, axis=0)) |
+            (L != np.roll(L, 1, axis=1)) |
+            (L != np.roll(L,-1, axis=1))
+        )
+        coast_touch = (
+            np.roll(water_mask, 1, axis=0) |
+            np.roll(water_mask,-1, axis=0) |
+            np.roll(water_mask, 1, axis=1) |
+            np.roll(water_mask,-1, axis=1)
+        )
+        return nz & (neighbor_diff | coast_touch)
+
+    def _country_capitals_local(pop, country_lbl):
+        """Population-weighted center of mass per country label."""
+        H, W = pop.shape; L = country_lbl
+        labels = np.unique(L[L > 0])
+        if labels.size == 0: return np.array([]), np.array([]), np.array([])
+        yy, xx = np.indices((H, W))
+        Lf = L.ravel(); Pf = pop.ravel().astype(np.float64)
+        yf = yy.ravel().astype(np.float64); xf = xx.ravel().astype(np.float64)
+        max_lab = int(labels.max())
+        sumP  = np.bincount(Lf, weights=Pf, minlength=max_lab+1)
+        sumPy = np.bincount(Lf, weights=Pf * yf, minlength=max_lab+1)
+        sumPx = np.bincount(Lf, weights=Pf * xf, minlength=max_lab+1)
+        valid_l = labels[sumP[labels] > 0]
+        if valid_l.size == 0: return np.array([]), np.array([]), np.array([])
+        cy = (sumPy[valid_l] / sumP[valid_l]); cx = (sumPx[valid_l] / sumP[valid_l])
+        return cy.astype(np.float32), cx.astype(np.float32), valid_l.astype(np.int32)
+
+    # ---------------- inputs & bases ----------------
+    H, W = pop_history[0].shape
+    T = len(pop_history)
+    biome = meta["biome"].astype(np.int16)
+    water_mask = meta["water_mask"].astype(bool)
+    culture_anchor = meta.get("culture_anchor")
+
+    # base biomes RGB image (0..1)
+    biome_colors = np.array([
+        [ 54,  90, 154],  # water
+        [237, 201, 175],  # sand
+        [120, 182,  96],  # grass
+        [ 52, 120,  73],  # forest
+        [130, 130, 130],  # rock
+        [240, 245, 250],  # snow
+    ], dtype=np.float32) / 255.0
+    biome_img = biome_colors[biome]  # (H,W,3)
+
+    # Plotly colorscales
+    pop_colorscale = "Magma"
+    att_colorscale = "Viridis"
+    mil_colorscale = "RdBu"  # diverging (blue=neg, red=pos)
+
+    pop_global_max = float(max(np.max(f) for f in pop_history))
+    att_global_max = float(max(np.max(a) for a in att_history)) if (att_history is not None) else 1.0
+
+    def _mcell(i):
+        if military_cell_history is not None:
+            return military_cell_history[i].astype(np.float32)
+        if ("military_trait" in meta) and (meta["military_trait"] is not None):
+            return meta["military_trait"].astype(np.float32)
+        return np.zeros_like(pop_history[0], dtype=np.float32)
+
+    # Prefer simulator-provided countries/capitals if present
+    sim_countries = meta.get("countries_history")
+    sim_capitals  = meta.get("capitals_history")
+
+    # ------------- build per-frame masked z arrays -------------
+    pop_zs, att_zs, mil_zs, borders, capitals = [], [], [], [], []
+    mil_vmin, mil_vmax = overlay_military_color_window
+
+    for i in range(T):
+        P = pop_history[i].astype(np.float32)
+
+        # POPULATION mask by threshold (NaN => transparent)
+        p_basis = pop_global_max if pop_global_max > 0 else float(P.max())
+        p_thr = pop_highlight_frac * (p_basis if p_basis > 0 else 1.0)
+        P_masked = P.copy().astype(np.float32)
+        P_masked[P_masked < p_thr] = np.nan
+        pop_zs.append(np.asarray(P_masked))
+
+        # ATTRACTIVENESS mask
+        if att_history is not None:
+            A = att_history[i].astype(np.float32)
+            a_basis = att_global_max if att_global_max > 0 else float(A.max())
+            a_thr = att_highlight_frac * (a_basis if a_basis > 0 else 1.0)
+            A_masked = A.copy().astype(np.float32)
+            A_masked[A_masked < a_thr] = np.nan
+            att_zs.append(np.asarray(A_masked))
+        else:
+            att_zs.append(np.full((H, W), np.nan, dtype=float))
+
+        # MILITARY (mask abs(stance) by threshold, clip to forced window)
+        M = _mcell(i)
+        stance_map, lbl, nlab, mask = _stance_map_local(
+            pop=P, military_cell=M, water_mask=water_mask,
+            thr=overlay_cluster_threshold, use_culture=overlay_use_culture,
+            culture_anchor=culture_anchor
+        )
+        m_abs_max = float(np.max(np.abs(stance_map))); m_abs_max = (m_abs_max if m_abs_max > 0 else 1.0)
+        m_thr = mil_highlight_frac * m_abs_max
+        M_masked = stance_map.copy().astype(np.float32)
+        M_masked[np.abs(M_masked) < m_thr] = np.nan
+        M_clip = np.clip(M_masked, mil_vmin, mil_vmax)
+        mil_zs.append(np.asarray(M_clip))
+
+        # Countries & borders & capitals — prefer simulator outputs
+        if sim_countries is not None and sim_capitals is not None and i < len(sim_countries) and i < len(sim_capitals):
+            c_lbl = sim_countries[i].astype(np.int32)
+            caps_i = sim_capitals[i]
+            cy, cx = caps_i["cy"], caps_i["cx"]
+        else:
+            c_lbl = _country_labels_clip_land_local(
+                stance_map, lbl, nlab, mask, water_mask,
+                base_radius=country_base_radius,
+                scale=country_scale,
+                gamma=country_gamma,
+                min_stance=country_min_stance
+            )
+            cy, cx, _ = _country_capitals_local(P, c_lbl)
+
+        edge = _country_edges_black_local(c_lbl, water_mask)
+        ey, ex = np.nonzero(edge)
+        borders.append((ey.astype(np.float32), ex.astype(np.float32)))
+
+        if cy.size == 0:
+            capitals.append((np.array([np.nan], dtype=float), np.array([np.nan], dtype=float)))
+        else:
+            capitals.append((cy.astype(float), cx.astype(float)))
+
+    # ---------------- build Plotly figure ----------------
+    fig = go.Figure()
+
+    # 0) Base biomes (Image)
+    fig.add_trace(go.Image(z=(biome_img * 255).astype(np.uint8), name="Biomes", visible=True))
+
+    # 1) Population Heatmap
+    fig.add_trace(go.Heatmap(
+        z=pop_zs[0],
+        colorscale=pop_colorscale,
+        zmin=0, zmax=max(1e-9, pop_global_max),
+        showscale=False,
+        name="Population",
+        visible=bool(show_population),
+        hoverinfo="skip",
+        opacity=1.0
+    ))
+
+    # 2) Attractiveness Heatmap
+    fig.add_trace(go.Heatmap(
+        z=att_zs[0],
+        colorscale=att_colorscale,
+        zmin=0, zmax=max(1e-9, att_global_max),
+        showscale=False,
+        name="Attractiveness",
+        visible=bool(show_attractiveness),
+        hoverinfo="skip",
+        opacity=1.0
+    ))
+
+    # 3) Military Heatmap (diverging, centered at 0)
+    fig.add_trace(go.Heatmap(
+        z=mil_zs[0],
+        colorscale=mil_colorscale,
+        zmin=mil_vmin, zmax=mil_vmax, zmid=0.0,
+        showscale=False,
+        name="Military",
+        visible=bool(show_military),
+        hoverinfo="skip",
+        opacity=1.0
+    ))
+
+    # 4) Borders (black points) — use SVG Scatter
+    by0, bx0 = borders[0]
+    fig.add_trace(go.Scatter(
+        x=bx0, y=by0, mode="markers", name="Borders",
+        marker=dict(color="black", size=2, opacity=float(country_edge_alpha)),
+        visible=bool(show_borders and country_overlay),
+        hoverinfo="skip"
+    ))
+
+    # 5) Capitals (big red circles)
+    cy0, cx0 = capitals[0]
+    fig.add_trace(go.Scatter(
+        x=cx0, y=cy0, mode="markers", name="Capitals",
+        marker=dict(symbol="circle", size=14, color="red", line=dict(width=1, color="black")),
+        visible=bool(show_capitals),
+        hovertemplate="Capital<extra></extra>"
+    ))
+
+    # -------- frames: update traces 1..5 (repeat styling, constant shapes) --------
+    import plotly.graph_objects as go  # ensure in scope
+    frames_list = []
+    for i in range(T):
+        by, bx = borders[i]
+        cy, cx = capitals[i]
+        frames_list.append(go.Frame(
+            name=str(i),
+            data=[
+                go.Heatmap(z=pop_zs[i], colorscale=pop_colorscale, zmin=0, zmax=max(1e-9, pop_global_max),
+                           showscale=False, hoverinfo="skip", opacity=1.0),
+                go.Heatmap(z=att_zs[i], colorscale=att_colorscale, zmin=0, zmax=max(1e-9, att_global_max),
+                           showscale=False, hoverinfo="skip", opacity=1.0),
+                go.Heatmap(z=mil_zs[i], colorscale=mil_colorscale, zmin=mil_vmin, zmax=mil_vmax, zmid=0.0,
+                           showscale=False, hoverinfo="skip", opacity=1.0),
+                go.Scatter(x=bx, y=by, mode="markers",
+                           marker=dict(color="black", size=2, opacity=float(country_edge_alpha)),
+                           hoverinfo="skip", name="Borders"),
+                go.Scatter(x=cx, y=cy, mode="markers",
+                           marker=dict(symbol="circle", size=14, color="red", line=dict(width=1, color="black")),
+                           hovertemplate="Capital<extra></extra>", name="Capitals"),
+            ],
+            traces=[1, 2, 3, 4, 5]
+        ))
+    fig.frames = frames_list
+
+    # slider
+    steps = [dict(
+        method="animate",
+        args=[[str(i)], {"mode": "immediate", "frame": {"duration": 0, "redraw": True}, "transition": {"duration": 0}}],
+        label=str(i)
+    ) for i in range(T)]
+    sliders = [dict(
+        active=0, steps=steps,
+        x=0.05, y=0.02, xanchor="left", yanchor="bottom",
+        currentvalue=dict(prefix="Year: ", visible=True)
+    )]
+
+    # on/off menus for each overlay layer (traces 1..5)
+    def _menu(label, trace_idx, x, y):
+        return dict(
+            type="buttons",
+            direction="right",
+            x=x, y=y, xanchor="left", yanchor="top",
+            showactive=True,
+            buttons=[
+                dict(label=f"{label}: On",  method="restyle", args=[{"visible": True},  [trace_idx]]),
+                dict(label=f"{label}: Off", method="restyle", args=[{"visible": False}, [trace_idx]]),
+            ]
+        )
+
+    updatemenus = [
+        _menu("Population",     1, 0.01, 1.04),
+        _menu("Attractiveness", 2, 0.27, 1.04),
+        _menu("Military",       3, 0.57, 1.04),
+        _menu("Borders",        4, 0.77, 1.04),
+        _menu("Capitals",       5, 0.90, 1.04),
+    ]
+
+    # layout/axes
+    fig.update_xaxes(showticklabels=False, visible=False, scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(showticklabels=False, visible=False, autorange="reversed")
+    fig.update_layout(
+        title=title,
+        height=height,
+        margin=dict(l=10, r=10, t=90, b=30),
+        showlegend=False,
+        sliders=sliders,
+        updatemenus=updatemenus,
+    )
+
+    # enforce initial vis flags
+    fig.data[0].visible = True
+    fig.data[1].visible = bool(show_population)
+    fig.data[2].visible = bool(show_attractiveness)
+    fig.data[3].visible = bool(show_military)
+    fig.data[4].visible = bool(show_borders and country_overlay)
+    fig.data[5].visible = bool(show_capitals)
+
+    return fig
+
+
 # =========================================================
-# Demo (you can replace the heightmap with your own)
+# Demo
 # =========================================================
 if __name__ == "__main__":
     H, W = 96, 128
@@ -1086,7 +1715,7 @@ if __name__ == "__main__":
     xs, ys = np.meshgrid(np.arange(W), np.arange(H))
     heightmap_xyz = np.column_stack([xs.ravel(), ys.ravel(), z.ravel()])
 
-    # --- run sim; record both attractiveness and military histories
+    # --- run sim; record attractiveness, military, and countries/capitals
     ((pops, atts), mils), meta = simulate_population_from_heightmap(
         heightmap_xyz,
         sea_level=0.0,
@@ -1123,6 +1752,14 @@ if __name__ == "__main__":
         military_period=24,
         military_strength=0.6,
         military_shape="sin",
+        # Countries & capitals (NEW)
+        record_countries=True,
+        overlay_cluster_threshold=2600.0,
+        overlay_use_culture=False,
+        country_base_radius=2.0,
+        country_scale=14.0,
+        country_gamma=1.25,
+        country_min_stance=0.08,
         # recording & performance
         save_every=1, dtype=np.float32, return_meta=True, record_attractiveness=True
     )
@@ -1139,40 +1776,56 @@ if __name__ == "__main__":
     )
 
     # 2) Biome + military overlay (alpha by |stance| vs threshold; colors via window)
-    visualize_population_with_totals(
-        pops, meta,
-        view="biome_overlay",
-        overlay_metric="military",
-        overlay_military_color_window=(-0.5, 0.5),
-        overlay_alpha_gamma=1.1,
-        overlay_alpha_min=0.6,
-        overlay_alpha_max=1,
+    #visualize_population_with_totals(
+    #    pops, meta,
+    #    view="biome_overlay",
+    #    overlay_metric="military",
+    #    overlay_military_color_window=(-0.5, 0.5),
+    #    overlay_alpha_gamma=1.1,
+    #    overlay_alpha_min=0.6,
+    #    overlay_alpha_max=1,
+    #    overlay_cluster_threshold=2600.0,
+    #    military_cell_history=mils,     # from the sim
+    #    # countries:
+    #    country_overlay=True,
+    #    country_base_radius=2.0,
+    #    country_scale=14.0,
+    #    country_gamma=1.2,
+    #    country_min_stance=0.08,
+    #    country_edge_alpha=0.95,
+    #    # country_edge_color="black",   # optional override
+    #    title_prefix="Military + Countries — Year ",
+    #    fps=12,
+    #)
+
+    # 3) Full military view (time-evolving)
+    #visualize_population_with_totals(
+    #    pop_history=pops,
+    #    meta=meta,
+    #    view="military",
+    #    military_cell_history=mils,         # <-- from sim
+    #    military_cmap="coolwarm",
+    #    military_color_window=(-0.5, 0.5),
+    #    cluster_threshold=2600.0,
+    #    cluster_use_culture=False,
+    #    fps=12,
+    #    title_prefix="Military — Year ",
+    #    last_frame_png_path="military_last.png"
+    #)
+
+    # 4) Plotly viz with toggles (now consumes capitals/countries from meta if present)
+    fig = visualize_plotly_countries(
+        pop_history=pops,
+        meta=meta,
+        att_history=atts,
+        military_cell_history=mils,
         overlay_cluster_threshold=2600.0,
-        military_cell_history=mils,     # from the sim
-        # countries:
+        overlay_military_color_window=(-0.5, 0.5),
         country_overlay=True,
         country_base_radius=2.0,
         country_scale=14.0,
-        country_gamma=1.2,
+        country_gamma=1.25,
         country_min_stance=0.08,
-        country_edge_alpha=0.95,
-        # country_edge_color="black",   # optional override
-        title_prefix="Military + Countries — Year ",
-        fps=12,
+        title="Biomes + Overlays (Plotly)"
     )
-
-
-    # 3) Full military view (time-evolving)
-    visualize_population_with_totals(
-        pop_history=pops,
-        meta=meta,
-        view="military",
-        military_cell_history=mils,         # <-- from sim
-        military_cmap="coolwarm",
-        military_color_window=(-0.5, 0.5),
-        cluster_threshold=2600.0,
-        cluster_use_culture=False,
-        fps=12,
-        title_prefix="Military — Year ",
-        last_frame_png_path="military_last.png"
-    )
+    fig.write_html("plotly_countries.html")
