@@ -15,6 +15,90 @@ import random
 from collections import defaultdict, Counter
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+
+RACE_SPECS = {
+        # Core & common
+        "humans":        (1,  0.10),
+        "elves":         (1, -0.85),
+        "dwarves":       (2, -0.25),
+        "halflings":     (2, -0.55),
+        "gnomes":        (2, -0.45),
+        "half-elves":    (2, -0.40),
+        "half-orcs":     (2,  0.55),
+        "dragonborn":    (3,  0.60),
+        "tieflings":     (3,  0.35),
+
+        # Elf subraces
+        "high elves":    (2, -0.80),
+        "wood elves":    (2, -0.75),
+        "drow":          (4,  0.76),
+        "eladrin":       (3, -0.65),
+        "sea elves":     (3, -0.70),
+        "shadar-kai":    (4,  0.50),
+
+        # Dwarves
+        "hill dwarves":     (2, -0.20),
+        "mountain dwarves": (2,  0.10),
+        "duergar":          (4,  0.65),
+
+        # Gnomes
+        "forest gnomes": (3, -0.50),
+        "rock gnomes":   (2, -0.35),
+        "deep gnomes":   (4,  0.20),
+
+        # Halflings
+        "lightfoot halflings": (2, -0.60),
+        "stout halflings":     (2, -0.45),
+
+        # Planetouched / exotic
+        "aasimar":       (3, -0.70),
+        "genasi":        (3,  0.00),
+        "firbolg":       (3, -0.80),
+        "goliaths":      (3,  0.40),
+        "aarakocra":     (3, -0.40),
+        "kenku":         (3,  0.20),
+        "tabaxi":        (3, -0.20),
+        "tortles":       (4, -0.10),
+        "yuan-ti purebloods": (4,  0.85),
+        "lizardfolk":    (3,  0.50),
+        "kobolds":       (3,  0.55),
+        "goblins":       (2,  0.70),
+        "hobgoblins":    (3,  0.80),
+        "bugbears":      (3,  0.90),
+        "orc":           (2,  0.75),
+        "gnolls":        (4,  0.95),
+
+        # Fey / nature aligned
+        "satyrs":        (3, -0.30),
+        "centaurs":      (3, -0.10),
+        "fairies":       (4, -0.85),
+        "harengon":      (4, -0.40),
+        "dryads":        (4, -0.90),
+
+        # Construct / undead / planar
+        "warforged":     (3,  0.45),
+        "reborn":        (4, -0.10),
+        "dhampir":       (4,  0.65),
+        "hexblood":      (4, -0.25),
+        "shardmind":     (5,  0.00),
+        "changeling":    (3, -0.30),
+        "kalashtar":     (3, -0.75),
+        "githyanki":     (4,  0.80),
+        "githzerai":     (4, -0.70),
+        "autognomes":    (4, -0.15),
+        "plasmoids":     (4,  0.10),
+        "thri-kreen":    (4,  0.50),
+        "locathah":      (4, -0.20),
+        "merfolk":       (3, -0.40),
+        "tritons":       (3, -0.30),
+
+        # Celestial / infernal extremes
+        "angelic celestials": (5, -1.00),
+        "devils":             (5,  1.00),
+        "demons":             (5,  0.95),
+        "archfey":            (5, -0.90),
+}
+
 # =========================================================
 # Neighbor utilities
 # =========================================================
@@ -66,15 +150,14 @@ def biome_id_from_scaled(land_scaled, water_mask, thresholds=(0.10, 0.40, 0.65, 
 
 def biome_migration_weight(biome):
     # Migration attractiveness (destination preference).
-    # Sand is ~neutral corridor (0.90), grass=1.00, forest slightly lower (0.85).
     return np.take(np.array([0.00, 0.90, 1.00, 0.85, 0.45, 0.10], np.float32), biome)
 
 def biome_capacity_factor(biome):
-    # Carrying capacity scaling; sand usable but lower than grass/forest.
+    # Carrying capacity scaling
     return np.take(np.array([0.00, 0.60, 1.00, 0.80, 0.40, 0.15], np.float32), biome)
 
 def biome_death_multiplier(biome):
-    # Mortality multiplier; sand only slightly worse than grass.
+    # Mortality multiplier
     return np.take(np.array([1.00, 1.02, 1.00, 1.05, 1.20, 1.40], np.float32), biome)
 
 # =========================================================
@@ -1955,6 +2038,40 @@ def visualize_plotly_countries(
     fig.data[5].visible = bool(show_capitals)
     return fig
 
+# Function to display pice charts of demographics in an html report using plotly
+def generate_demographics_report(meta, output_html_path="demographics_report.html"):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    demographics_last = meta.get("demographics_last")
+    country_names_last = meta.get("country_names_last") or {}
+    capital_names_last = meta.get("capital_names_last") or {}
+
+    if demographics_last is None:
+        raise ValueError("No demographics data found in meta.")
+
+    countries = list(demographics_last.keys())
+    n_countries = len(countries)
+    n_cols = 3
+    n_rows = (n_countries + n_cols - 1) // n_cols
+
+    fig = make_subplots(rows=n_rows, cols=n_cols,
+                        subplot_titles=[f"{country_names_last.get(c, 'Country '+str(c))} (Capital: {capital_names_last.get(c, 'N/A')})"
+                                        for c in countries])
+
+    for idx, country in enumerate(countries):
+        row = (idx // n_cols) + 1
+        col = (idx % n_cols) + 1
+        demo_data = demographics_last[country]
+        labels = list(demo_data.keys())
+        values = [demo_data[label] for label in labels]
+
+        fig.add_trace(go.Pie(labels=labels, values=values, hole=0.3), row=row, col=col)
+
+    fig.update_layout(height=300 * n_rows, width=900, title_text="Demographics Distribution by Country")
+
+    fig.write_html(output_html_path)
+
 
 # =========================================================
 # Demo (includes demographics spec, naming, and final printed report)
@@ -1967,89 +2084,6 @@ if __name__ == "__main__":
     xs, ys = np.meshgrid(np.arange(W), np.arange(H))
     heightmap_xyz = np.column_stack([xs.ravel(), ys.ravel(), z.ravel()])
 
-    # Demographics spec: race -> (rarity_score:int>=1, military_stance_preference in [-1,1])
-    demo_spec = {
-        # Core & common
-        "humans":        (1,  0.10),
-        "elves":         (1, -0.85),
-        "dwarves":       (2, -0.25),
-        "halflings":     (2, -0.55),
-        "gnomes":        (2, -0.45),
-        "half-elves":    (2, -0.40),
-        "half-orcs":     (2,  0.55),
-        "dragonborn":    (3,  0.60),
-        "tieflings":     (3,  0.35),
-
-        # Elf subraces
-        "high elves":    (2, -0.80),
-        "wood elves":    (2, -0.75),
-        "drow":          (4,  0.76),
-        "eladrin":       (3, -0.65),
-        "sea elves":     (3, -0.70),
-        "shadar-kai":    (4,  0.50),
-
-        # Dwarves
-        "hill dwarves":     (2, -0.20),
-        "mountain dwarves": (2,  0.10),
-        "duergar":          (4,  0.65),
-
-        # Gnomes
-        "forest gnomes": (3, -0.50),
-        "rock gnomes":   (2, -0.35),
-        "deep gnomes":   (4,  0.20),
-
-        # Halflings
-        "lightfoot halflings": (2, -0.60),
-        "stout halflings":     (2, -0.45),
-
-        # Planetouched / exotic
-        "aasimar":       (3, -0.70),
-        "genasi":        (3,  0.00),
-        "firbolg":       (3, -0.80),
-        "goliaths":      (3,  0.40),
-        "aarakocra":     (3, -0.40),
-        "kenku":         (3,  0.20),
-        "tabaxi":        (3, -0.20),
-        "tortles":       (4, -0.10),
-        "yuan-ti purebloods": (4,  0.85),
-        "lizardfolk":    (3,  0.50),
-        "kobolds":       (3,  0.55),
-        "goblins":       (2,  0.70),
-        "hobgoblins":    (3,  0.80),
-        "bugbears":      (3,  0.90),
-        "orc":           (2,  0.75),
-        "gnolls":        (4,  0.95),
-
-        # Fey / nature aligned
-        "satyrs":        (3, -0.30),
-        "centaurs":      (3, -0.10),
-        "fairies":       (4, -0.85),
-        "harengon":      (4, -0.40),
-        "dryads":        (4, -0.90),
-
-        # Construct / undead / planar
-        "warforged":     (3,  0.45),
-        "reborn":        (4, -0.10),
-        "dhampir":       (4,  0.65),
-        "hexblood":      (4, -0.25),
-        "shardmind":     (5,  0.00),
-        "changeling":    (3, -0.30),
-        "kalashtar":     (3, -0.75),
-        "githyanki":     (4,  0.80),
-        "githzerai":     (4, -0.70),
-        "autognomes":    (4, -0.15),
-        "plasmoids":     (4,  0.10),
-        "thri-kreen":    (4,  0.50),
-        "locathah":      (4, -0.20),
-        "merfolk":       (3, -0.40),
-        "tritons":       (3, -0.30),
-
-        # Celestial / infernal extremes
-        "angelic celestials": (5, -1.00),
-        "devils":             (5,  1.00),
-        "demons":             (5,  0.95),
-        "archfey":            (5, -0.90),
-    }
 
     # --- run sim; record attractiveness, military, countries/capitals, demographics, and generate names
     ((pops, atts), mils), meta = simulate_population_from_heightmap(
@@ -2080,7 +2114,7 @@ if __name__ == "__main__":
         exodus_group_frac=0.22, exodus_min_dist=50,
         exodus_max_dist=None, exodus_target_bias_water=0.0,
         exodus_target_bias_empty=0.8, exodus_culture_factor=0.5,
-        # Military forcing in the sim
+        # Military forcing
         military_enabled=True,
         record_military=True,
         military_forcing_enabled=True,
@@ -2097,7 +2131,7 @@ if __name__ == "__main__":
         country_gamma=1.25,
         country_min_stance=0.08,
         # DEMOGRAPHICS
-        demographics_spec=demo_spec,
+        demographics_spec=RACE_SPECS,
         record_demographics=True,
         rarity_exponent=1.0,
         demographics_sigma=0.45,
@@ -2125,21 +2159,21 @@ if __name__ == "__main__":
     )
 
     # 2) Plotly viz with toggles
-    fig = visualize_plotly_countries(
-        pop_history=pops,
-        meta=meta,
-        att_history=atts,
-        military_cell_history=mils,
-        overlay_cluster_threshold=2600.0,
-        overlay_military_color_window=(-0.5, 0.5),
-        country_overlay=True,
-        country_base_radius=2.0,
-        country_scale=14.0,
-        country_gamma=1.25,
-        country_min_stance=0.08,
-        title="Biomes + Overlays (Plotly)"
-    )
-    fig.write_html("plotly_countries.html")
+    #fig = visualize_plotly_countries(
+    #    pop_history=pops,
+    #    meta=meta,
+    #    att_history=atts,
+    #    military_cell_history=mils,
+    #    overlay_cluster_threshold=2600.0,
+    #    overlay_military_color_window=(-0.5, 0.5),
+    #    country_overlay=True,
+    #    country_base_radius=2.0,
+    #    country_scale=14.0,
+    #    country_gamma=1.25,
+    #    country_min_stance=0.08,
+    #    title="Biomes + Overlays (Plotly)"
+    #)
+    #fig.write_html("plotly_countries.html")
 
     # ===== Pretty print: final named countries, capitals, demographics (≥0.01%), pop and military =====
     caps = meta.get("capitals_last")
@@ -2172,5 +2206,7 @@ if __name__ == "__main__":
             print(f" - [{lab:3d}] {cname} (race: {race}) — Capital: {kname} at (y={y:.1f}, x={x:.1f})")
             print(f"     Pop: {pop_total:,} | Military stance: {sign}{mean_stance:.2f} | Strength: {int(0.04*pop_total*strength):,}")
             print(f"     Demographics: {demo_str}")
+
+            generate_demographics_report(meta)
     else:
         print("\n(No capitals or demographics recorded.)")
