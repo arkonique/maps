@@ -2207,6 +2207,6 @@ if __name__ == "__main__":
             print(f"     Pop: {pop_total:,} | Military stance: {sign}{mean_stance:.2f} | Strength: {int(0.04*pop_total*strength):,}")
             print(f"     Demographics: {demo_str}")
 
-            generate_demographics_report(meta)
+            #generate_demographics_report(meta)
     else:
         print("\n(No capitals or demographics recorded.)")
