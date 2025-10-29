@@ -1,0 +1,6 @@
+imageio==2.37.0
+matplotlib==3.10.7
+numba==0.61.2
+numpy==2.3.4
+plotly==6.3.0
+scipy==1.16.3
